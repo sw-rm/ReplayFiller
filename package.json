@@ -1,0 +1,16 @@
+{
+  "name": "replayfill",
+  "version": "1.0.0",
+  "description": "",
+  "main": "replayfill.js",
+  "dependencies": {
+    "mineflayer": "github:aesthetic0001/mineflayer"
+  },
+  "scripts": {
+    "start": "node replayfill.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}
