@@ -8,9 +8,9 @@ A mineflayer bot to automate filling replays for an account on hypixel.net
 
 ## Installation
 
-- Download the latest version of [node.js](https://nodejs.org/en/download)
+- Download the latest version of [node.js](<https://nodejs.org/en/download>)
 
-- Download the latest version of the Replay Filler from [here](https://github.com/sw-rm/ReplayFiller/releases) 
+- Download the latest version of the Replay Filler from [here](<https://github.com/sw-rm/ReplayFiller/releases>) 
 
 - Extract the .zip file 
 
@@ -39,5 +39,5 @@ To clear account cache on Windows,  run:
 
 ## Authors
 
-- [@sw-rm](https://github.com/sw-rm)
+- [@sw-rm](<https://github.com/sw-rm>)
 
