@@ -12,7 +12,7 @@ A mineflayer bot to automate filling replays for an account on hypixel.net
 
 - Download the latest version of the Replay Filler from [here](https://github.com/sw-rm/ReplayFiller/releases) 
 
-Extract the .zip file 
+- Extract the .zip file 
 
 Enter the root directory:
 ```bash
