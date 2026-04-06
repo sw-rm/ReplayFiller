@@ -14,14 +14,14 @@ Works on **Windows, macOS, and Linux**
 
 Enter the root directory:
 ```bash
-  cd ReplayFiller
+cd ReplayFiller
 ```
     
 ## Deployment
 
 Install dependencies:
 ```bash
-  npm install
+npm install
 ```
 
 Start the bot:
