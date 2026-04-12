@@ -1,10 +1,23 @@
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const https = require("https");
 const { spawn } = require("child_process");
 
 // -- Directory layout ---------------------------------------------------------
-const ACCOUNTS_DIR = path.join(__dirname, "accounts");
+function getDataDir() {
+  const appName = "ReplayFiller";
+  switch (process.platform) {
+    case "win32":
+      return path.join(process.env.APPDATA, appName);
+    case "darwin":
+      return path.join(os.homedir(), "Library", "Application Support", appName);
+    default:
+      return path.join(os.homedir(), ".local", "share", appName);
+  }
+}
+
+const ACCOUNTS_DIR = getDataDir();
 if (!fs.existsSync(ACCOUNTS_DIR))
   fs.mkdirSync(ACCOUNTS_DIR, { recursive: true });
 
@@ -55,16 +68,8 @@ function deleteAccount(uuid) {
 
 function tokenDirForUUID(uuid) {
   const base = path.join(ACCOUNTS_DIR, uuid);
-  if (process.platform === "win32")
-    return path.join(base, "AppData", "Roaming", ".minecraft", "nmp-cache");
   if (process.platform === "darwin")
-    return path.join(
-      base,
-      "Library",
-      "Application Support",
-      "minecraft",
-      "nmp-cache",
-    );
+    return path.join(base, "Library", "Application Support", "minecraft", "nmp-cache");
   return path.join(base, ".minecraft", "nmp-cache");
 }
 
@@ -76,6 +81,7 @@ function isCacheValid(uuid) {
   const files = fs
     .readdirSync(tokenDir)
     .filter((f) => f.endsWith("_mca-cache.json"));
+
   for (const filename of files) {
     try {
       const data = JSON.parse(
@@ -83,8 +89,8 @@ function isCacheValid(uuid) {
       );
       const candidates = [];
       if (data?.mca) candidates.push(data.mca);
-      for (const val of Object.values(data)) {
-        if (val?.mca) candidates.push(val.mca);
+      for (const [key, val] of Object.entries(data)) {
+        if (key !== "mca" && val?.mca) candidates.push(val.mca);
       }
       for (const mca of candidates) {
         if (mca.obtainedOn + mca.expires_in * 1000 > Date.now()) return true;
@@ -161,6 +167,10 @@ async function buildAccountList() {
 function runBot(account) {
   const accountDir = path.join(ACCOUNTS_DIR, account.uuid);
 
+  const workerPath = process.pkg
+    ? path.join(path.dirname(process.execPath), "BotWorker.js")
+    : path.join(__dirname, "BotWorker.js");
+
   const env = {
     ...process.env,
     HOME: accountDir,
@@ -175,7 +185,7 @@ function runBot(account) {
 
   const worker = spawn(
     process.execPath,
-    [path.join(__dirname, "BotWorker.js")],
+    [workerPath],
     {
       env,
       stdio: ["inherit", "inherit", "inherit"],

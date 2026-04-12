@@ -1,36 +1,22 @@
 # Replay Filler
 
-A mineflayer bot to automate filling replays on Hypixel. Supports multiple accounts — each account's login tokens are cached locally inside the project folder, so no external files are created and switching between accounts is seamless.
+A mineflayer bot to automate filling replays on Hypixel. Supports multiple accounts - each account's login tokens are cached locally, so switching between accounts is seamless.
 
 Works on **Windows, macOS, and Linux**.
 
 ## Installation
 
-- Download the latest version of [Node.js](https://nodejs.org/en/download)
+Download the latest binary for your platform from [Releases](https://github.com/sw-rm/ReplayFiller/releases):
 
-- Download the latest version of Replay Filler from [here](https://github.com/sw-rm/ReplayFiller/releases)
-
-- Extract the `.zip` file
-
-Enter the root directory:
-
-```bash
-cd ReplayFiller
-```
-
-## Deployment
-
-Install dependencies:
-
-```bash
-npm install
-```
-
-Start the bot:
-
-```bash
-npm start
-```
+- **Windows** — download `replayfill-win.exe` and run it
+- **macOS** — download `replayfill-macos`, then run:
+  ```bash
+  chmod +x replayfill-macos && ./replayfill-macos
+  ```
+- **Linux** — download `replayfill-linux`, then run:
+  ```bash
+  chmod +x replayfill-linux && ./replayfill-linux
+  ```
 
 On launch you will be presented with a menu to add, select, or delete accounts.
 
@@ -42,16 +28,20 @@ Accounts are managed through the interactive menu at startup:
 - **Select account & start** - pick a saved account to begin the replay fill loop. Each account displays its current IGN (refreshed live from Mojang) alongside a `[VALID]` or `[INVALID]` status indicating whether the cached login token is still usable. Selecting an `[INVALID]` account will trigger a Microsoft re-login.
 - **Delete account** - permanently removes an account and all of its cached tokens.
 
-The project folder will contain an `accounts/` directory created automatically at runtime, with one subfolder per account:
+Account data is stored in an OS-native location created automatically at runtime:
+
+- **Windows:** `%APPDATA%\ReplayFiller\`
+- **macOS:** `~/Library/Application Support/ReplayFiller/`
+- **Linux:** `~/.local/share/ReplayFiller/`
+
+Each account gets its own subfolder:
 
 ```
 ReplayFiller/
-└── accounts/
-    └── <uuid>/
-        ├── meta.json                                          <- stores UUID and last known IGN
-        ├── .minecraft/nmp-cache/                              <- token cache (Linux)
-        ├── Library/Application Support/minecraft/nmp-cache/  <- token cache (Mac)
-        └── AppData/Roaming/.minecraft/nmp-cache/              <- token cache (Windows)
+└── <uuid>/
+    ├── meta.json                                          <- stores UUID and last known IGN
+    ├── .minecraft/nmp-cache/                              <- token cache (Windows & Linux)
+    └── Library/Application Support/minecraft/nmp-cache/  <- token cache (Mac)
 ```
 
 Each account's tokens are fully isolated so switching accounts always uses the correct credentials.

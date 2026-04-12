@@ -22,19 +22,10 @@ let isPaused = false;
 
 function tokenDir() {
   const base = path.join(ACCOUNTS_DIR, uuid);
-  if (process.platform === "win32")
-    return path.join(base, "AppData", "Roaming", ".minecraft", "nmp-cache");
   if (process.platform === "darwin")
-    return path.join(
-      base,
-      "Library",
-      "Application Support",
-      "minecraft",
-      "nmp-cache",
-    );
+    return path.join(base, "Library", "Application Support", "minecraft", "nmp-cache");
   return path.join(base, ".minecraft", "nmp-cache");
 }
-
 function createBot() {
   const tDir = tokenDir();
   if (!fs.existsSync(tDir)) fs.mkdirSync(tDir, { recursive: true });
