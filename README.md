@@ -20,6 +20,41 @@ Download the latest binary for your platform from [Releases](https://github.com/
 
 On launch you will be presented with a menu to add, select, or delete accounts.
 
+## Building from Source
+
+If you prefer to run from source rather than downloading a binary, you'll need [Node.js](https://nodejs.org/) (v18 or later) installed.
+
+**1. Clone the repository and install dependencies:**
+
+```bash
+git clone https://github.com/sw-rm/ReplayFiller.git
+cd ReplayFiller
+npm install
+```
+
+**2. Run directly without building:**
+
+```bash
+node replayfill.js
+```
+
+**3. Or build a standalone binary for your platform:**
+
+```bash
+# Install the pkg bundler globally
+npm install -g pkg
+
+# Build for all platforms at once
+npm run build
+
+# Or build for a specific platform only
+npm run build:win    # Windows (.exe)
+npm run build:linux  # Linux
+npm run build:mac    # macOS
+```
+
+Binaries are output to the `dist/` folder. The build targets Node.js 18 and produces self-contained executables — no Node.js installation required to run them.
+
 ## Account Management
 
 Accounts are managed through the interactive menu at startup:
