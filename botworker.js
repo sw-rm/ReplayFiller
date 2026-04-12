@@ -1,12 +1,31 @@
-// BotWorker.js — runs as a child process with HOME/APPDATA already set to accounts/<uuid>/ by the parent
+// BotWorker.js - runs as a child process with HOME/APPDATA already set to accounts/<uuid>/ by the parent
+// Copyright (C) 2026  sw-rm
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+// -- Imports ------------------------------------------------------------------
 const path = require("path");
 const fs = require("fs");
 
+// -- Config -------------------------------------------------------------------
 const uuid = process.env.RF_UUID;
 const ign = process.env.RF_IGN;
 const ACCOUNTS_DIR = process.env.RF_ACCOUNTS_DIR;
 
 const mineflayer = require("mineflayer");
+
+// -- Readline -----------------------------------------------------------------
 const readline = require("readline");
 
 const rl = readline.createInterface({
@@ -14,12 +33,14 @@ const rl = readline.createInterface({
   output: process.stdout,
 });
 
+// -- State --------------------------------------------------------------------
 let bot = null;
 let currentInterval = null;
 let spawnTimeout = null;
 let count = 0;
 let isPaused = false;
 
+// -- Helpers ------------------------------------------------------------------
 function tokenDir() {
   const base = path.join(ACCOUNTS_DIR, uuid);
   if (process.platform === "darwin")
@@ -84,6 +105,7 @@ function startHousingLoop() {
   }, 3750);
 }
 
+// -- Commands -----------------------------------------------------------------
 function stopBot() {
   isPaused = true;
   clearLoop();
@@ -106,6 +128,7 @@ function continueBot() {
   createBot();
 }
 
+// -- Input handling -----------------------------------------------------------
 rl.on("line", (input) => {
   const cmd = input.trim().toLowerCase();
   switch (cmd) {
@@ -142,6 +165,7 @@ rl.on("line", (input) => {
   }
 });
 
+// -- Graceful shutdown --------------------------------------------------------
 process.on("SIGINT", () => {
   console.log("\nShutting down...");
   if (bot) bot.quit("Process terminated");
@@ -149,4 +173,5 @@ process.on("SIGINT", () => {
   process.exit(0);
 });
 
+// -- Entry point --------------------------------------------------------------
 createBot();
