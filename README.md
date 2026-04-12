@@ -8,12 +8,12 @@ Works on **Windows, macOS, and Linux**.
 
 Download the latest binary for your platform from [Releases](https://github.com/sw-rm/ReplayFiller/releases):
 
-- **Windows** — download `replayfill-win.exe` and run it
-- **macOS** — download `replayfill-macos`, then run:
+- **Windows:** Download `replayfill-win.exe` and run it
+- **macOS:** Download `replayfill-macos`, then run:
   ```bash
   chmod +x replayfill-macos && ./replayfill-macos
   ```
-- **Linux** — download `replayfill-linux`, then run:
+- **Linux:** Download `replayfill-linux`, then run:
   ```bash
   chmod +x replayfill-linux && ./replayfill-linux
   ```
@@ -53,7 +53,7 @@ npm run build:linux  # Linux
 npm run build:mac    # macOS
 ```
 
-Binaries are output to the `dist/` folder. The build targets Node.js 18 and produces self-contained executables — no Node.js installation required to run them.
+Binaries are output to the `dist/` folder. The build targets Node.js 18 and produces self-contained executables so no Node.js installation is required to run them.
 
 ## Account Management
 
