@@ -53,7 +53,7 @@ npm run build:linux  # Linux
 npm run build:mac    # macOS
 ```
 
-Binaries are output to the `dist/` folder. The build targets Node.js 18 and produces self-contained executables — no Node.js installation required to run them.
+Binaries are output to the `dist/` folder. The build targets Node.js 18 and produces self-contained executables so no Node.js installation is required to run them.
 
 ## Account Management
 
