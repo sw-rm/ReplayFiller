@@ -20,6 +20,7 @@ const fs = require("fs");
 const os = require("os");
 const https = require("https");
 const { spawn } = require("child_process");
+const { startBotWorker } = require("./BotWorker");
 
 // -- Directory layout ---------------------------------------------------------
 function getDataDir() {
@@ -180,34 +181,27 @@ async function buildAccountList() {
 }
 
 // -- Bot worker ---------------------------------------------------------------
-// The bot runs in a child process with HOME/APPDATA set to accounts/<uuid>/
 function runBot(account) {
   const accountDir = path.join(ACCOUNTS_DIR, account.uuid);
 
-  const workerPath = process.pkg
-    ? path.join(path.dirname(process.execPath), "BotWorker.js")
-    : path.join(__dirname, "BotWorker.js");
-
   const env = {
-    ...process.env,
-    HOME: accountDir,
-    APPDATA: accountDir,
-    RF_UUID: account.uuid,
-    RF_IGN: account.ign,
-    RF_ACCOUNTS_DIR: ACCOUNTS_DIR,
-  };
+  ...process.env,
+  HOME: accountDir,
+  APPDATA: accountDir,
+  RF_UUID: account.uuid,
+  RF_IGN: account.ign,
+  RF_ACCOUNTS_DIR: ACCOUNTS_DIR,
+  RF_WORKER: "1",
+  NODE_OPTIONS: "--no-experimental-fetch",
+};
 
   rl.close();
   process.stdin.pause();
 
-  const worker = spawn(
-    process.execPath,
-    [workerPath],
-    {
-      env,
-      stdio: ["inherit", "inherit", "inherit"],
-    },
-  );
+  const worker = spawn(process.execPath, [process.argv[1]], {
+    env,
+    stdio: "inherit",
+  });
 
   worker.on("exit", (code) => {
     rl = readline.createInterface({
@@ -374,4 +368,11 @@ process.on("SIGINT", () => {
 });
 
 // -- Entry point --------------------------------------------------------------
-mainMenu();
+if (process.env.RF_WORKER === "1") {
+  startBotWorker().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else {
+  mainMenu();
+}

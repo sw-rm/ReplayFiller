@@ -9,10 +9,17 @@ Works on **Windows, macOS, and Linux**.
 Download the latest binary for your platform from [Releases](https://github.com/sw-rm/ReplayFiller/releases):
 
 - **Windows:** Download `replayfill-win.exe` and run it
+
 - **macOS:** Download `replayfill-macos`, then run:
   ```bash
   chmod +x replayfill-macos && ./replayfill-macos
   ```
+
+  If macOS blocks the app (unidentified developer), run:
+  ```bash
+  xattr -d com.apple.quarantine replayfill-macos
+  ```
+
 - **Linux:** Download `replayfill-linux`, then run:
   ```bash
   chmod +x replayfill-linux && ./replayfill-linux
@@ -35,7 +42,7 @@ npm install
 **2. Run directly without building:**
 
 ```bash
-node replayfill.js
+node ReplayFill.js
 ```
 
 **3. Or build a standalone binary for your platform:**

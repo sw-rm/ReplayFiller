@@ -2,8 +2,8 @@
   "name": "replayfill",
   "version": "1.0.0",
   "description": "A mineflayer bot to automate filling replays on Hypixel. Supports multiple accounts - each account's login tokens are cached locally inside the project folder, so no external files are created and switching between accounts is seamless.",
-  "main": "replayfill.js",
-  "bin": "replayfill.js",
+  "main": "ReplayFill.js",
+  "bin": "ReplayFill.js",
   "dependencies": {
     "mineflayer": "github:aesthetic0001/mineflayer"
   },
@@ -16,7 +16,7 @@
   "pkg": {
     "assets": [],
     "scripts": [
-      "replayfill.js",
+      "ReplayFill.js",
       "BotWorker.js"
     ]
   },
