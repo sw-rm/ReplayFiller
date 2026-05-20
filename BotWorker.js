@@ -1,4 +1,4 @@
-// BotWorker.js - runs as a child process with HOME/APPDATA already set to accounts/<uuid>/ by the parent
+// BotWorker.js - runs as a child process with the selected account cache path set by the parent
 // Copyright (C) 2026  sw-rm
 //
 // This program is free software: you can redistribute it and/or modify
@@ -30,12 +30,19 @@ process.emit = function (name, data) {
 // -- Imports ------------------------------------------------------------------
 const path = require("path");
 const fs = require("fs");
+const { Titles } = require("prismarine-auth");
+
+const DEFAULT_LOOP_TARGET = 600;
 
 // -- Config -------------------------------------------------------------------
 async function startBotWorker() {
   const uuid = process.env.RF_UUID;
   const ign = process.env.RF_IGN;
   const ACCOUNTS_DIR = process.env.RF_ACCOUNTS_DIR;
+  const authCacheDir = process.env.RF_AUTH_CACHE_DIR;
+  const authUsername = process.env.RF_AUTH_USERNAME || "Player";
+  const sourceSessionFile = process.env.RF_SOURCE_SESSION_PATH;
+  const loopTarget = parseLoopTarget(process.env.RF_LOOP_TARGET);
 
   const mineflayer = require("mineflayer");
 
@@ -53,14 +60,36 @@ async function startBotWorker() {
   let spawnTimeout = null;
   let count = 0;
   let isPaused = false;
+  let authMismatch = false;
+  let usingSourceAuth = false;
 
 // -- Helpers ------------------------------------------------------------------
+  function parseLoopTarget(value) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed > 0
+      ? parsed
+      : DEFAULT_LOOP_TARGET;
+  }
+
   function tokenDir() {
+    if (authCacheDir) return authCacheDir;
     const base = path.join(ACCOUNTS_DIR, uuid);
     if (process.platform === "darwin") {
       return path.join(base, "Library", "Application Support", "minecraft", "nmp-cache");
     }
     return path.join(base, ".minecraft", "nmp-cache");
+  }
+
+  function normalizeUUID(value) {
+    return String(value || "")
+      .replace(/-/g, "")
+      .toLowerCase();
+  }
+
+  function formatUUID(value) {
+    const stripped = normalizeUUID(value);
+    if (stripped.length !== 32) return value;
+    return `${stripped.slice(0, 8)}-${stripped.slice(8, 12)}-${stripped.slice(12, 16)}-${stripped.slice(16, 20)}-${stripped.slice(20)}`;
   }
 
   function clearLoop() {
@@ -74,19 +103,92 @@ async function startBotWorker() {
     }
   }
 
+  function clearTokenCache() {
+    const tDir = tokenDir();
+    if (fs.existsSync(tDir)) {
+      fs.rmSync(tDir, { recursive: true, force: true });
+    }
+    fs.mkdirSync(tDir, { recursive: true });
+  }
+
+  function readSourceSession() {
+    try {
+      return JSON.parse(fs.readFileSync(sourceSessionFile, "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  function isSourceSessionValid(session) {
+    if (
+      !session?.session?.accessToken ||
+      !session?.session?.selectedProfile?.id
+    ) {
+      return false;
+    }
+    return (
+      normalizeUUID(session.session.selectedProfile.id) === normalizeUUID(uuid) &&
+      isAccessTokenFresh(session.expiresAt)
+    );
+  }
+
+  function isAccessTokenFresh(expiresAt) {
+    if (!expiresAt) return true;
+    const expires = new Date(expiresAt).getTime();
+    return Number.isFinite(expires) && expires > Date.now() + 30_000;
+  }
+
+  function buildBotOptions(tDir) {
+    const sourceSession = readSourceSession();
+    if (isSourceSessionValid(sourceSession)) {
+      usingSourceAuth = true;
+      console.log(
+        `[${ign}] Using ${sourceSession.selectedSource?.label || "source"} session.`,
+      );
+      return {
+        host: "hypixel.net",
+        version: "1.8.9",
+        username: sourceSession.session.selectedProfile.name,
+        auth: require("minecraft-protocol/src/client/mojangAuth"),
+        session: sourceSession.session,
+        profilesFolder: false,
+        skipValidation: true,
+      };
+    }
+
+    usingSourceAuth = false;
+    return {
+      host: "hypixel.net",
+      version: "1.8.9",
+      username: authUsername,
+      auth: "microsoft",
+      authTitle: Titles.MinecraftNintendoSwitch,
+      deviceType: "Nintendo",
+      flow: "live",
+      skipValidation: true,
+      profilesFolder: tDir,
+      onMsaCode: (data) => {
+        const url = `${data.verification_uri}?otc=${data.user_code}`;
+        console.log(`[${ign}] Microsoft authentication required.`);
+        console.log(`[${ign}] Open: ${url}`);
+        console.log(`[${ign}] Code: ${data.user_code}`);
+      },
+    };
+  }
+
   function startHousingLoop() {
     clearLoop();
-    console.log(`[${ign}] Starting /housing random loop...`);
+    console.log(`[${ign}] Starting /housing random loop (${loopTarget} total)...`);
     currentInterval = setInterval(() => {
-      if (count >= 999) {
+      if (count >= loopTarget) {
         clearLoop();
-        console.log(`[${ign}] Completed 999 /housing random commands.`);
+        console.log(`[${ign}] Completed ${loopTarget} /housing random commands.`);
         return;
       }
       if (bot && !isPaused) {
         count++;
         bot.chat("/housing random");
-        console.log(`[${ign}] Sent /housing random (${count}/999)`);
+        console.log(`[${ign}] Sent /housing random (${count}/${loopTarget})`);
       }
     }, 3750);
   }
@@ -95,15 +197,26 @@ async function startBotWorker() {
     const tDir = tokenDir();
     if (!fs.existsSync(tDir)) fs.mkdirSync(tDir, { recursive: true });
 
-    bot = mineflayer.createBot({
-      host: "hypixel.net",
-      version: "1.8.9",
-      auth: "microsoft",
-      skipValidation: true,
-      cachePath: tDir,
+    bot = mineflayer.createBot(buildBotOptions(tDir));
+
+    bot._client.on("session", (session) => {
+      const profile = session?.selectedProfile;
+      if (!profile?.id) return;
+
+      const profileUUID = formatUUID(profile.id);
+      if (normalizeUUID(profileUUID) !== normalizeUUID(uuid)) {
+        authMismatch = true;
+        console.log(
+          `[${ign}] Authenticated as ${profile.name} (${profileUUID}), expected ${ign} (${uuid}).`,
+        );
+        clearLoop();
+        if (!usingSourceAuth) clearTokenCache();
+        bot.end("Authenticated account does not match selected account");
+      }
     });
 
     bot.once("spawn", () => {
+      if (authMismatch) return;
       console.log(`[${ign}] Bot spawned, waiting for Hypixel welcome...`);
       spawnTimeout = setTimeout(() => {
         if (!isPaused) startHousingLoop();
@@ -119,6 +232,16 @@ async function startBotWorker() {
       console.log(`[${ign}] Error:`, err);
       clearLoop();
     });
+
+    bot.on("end", () => {
+      clearLoop();
+      bot = null;
+      if (authMismatch) {
+        console.log(
+          `[${ign}] Stopped because the authenticated account does not match this ReplayFiller account.`,
+        );
+      }
+    });
   }
 
 // -- Commands -----------------------------------------------------------------
@@ -130,7 +253,7 @@ async function startBotWorker() {
       bot = null;
     }
     console.log(
-      `Bot stopped. Progress: ${count}/999. Type 'continue' to resume or 'menu' to go back.`,
+      `Bot stopped. Progress: ${count}/${loopTarget}. Type 'continue' to resume or 'menu' to go back.`,
     );
   }
 
@@ -140,7 +263,7 @@ async function startBotWorker() {
       return;
     }
     isPaused = false;
-    console.log(`Resuming [${ign}]... Progress: ${count}/999`);
+    console.log(`Resuming [${ign}]... Progress: ${count}/${loopTarget}`);
     createBot();
   }
 
@@ -156,7 +279,7 @@ async function startBotWorker() {
         break;
       case "status":
         console.log(
-          `Account: ${ign} | Status: ${isPaused ? "Paused" : "Running"} | Progress: ${count}/999`,
+          `Account: ${ign} | Status: ${isPaused ? "Paused" : "Running"} | Progress: ${count}/${loopTarget}`,
         );
         break;
       case "menu":

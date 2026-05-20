@@ -20,19 +20,54 @@ const fs = require("fs");
 const os = require("os");
 const https = require("https");
 const { spawn } = require("child_process");
+const { Authflow, Titles } = require("prismarine-auth");
 const { startBotWorker } = require("./BotWorker");
+
+const APP_NAME = "ReplayFiller";
+const AUTH_CACHE_USERNAME = "Player";
+const AUTH_FLOW_OPTIONS = {
+  authTitle: Titles.MinecraftNintendoSwitch,
+  deviceType: "Nintendo",
+  flow: "live",
+};
+const CACHE_EXPIRY_SKEW_MS = 30_000;
+const DEFAULT_LOOP_TARGET = 600;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // -- Directory layout ---------------------------------------------------------
 function getDataDir() {
-  const appName = "ReplayFiller";
   switch (process.platform) {
     case "win32":
-      return path.join(process.env.APPDATA, appName);
+      return path.join(
+        process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
+        APP_NAME,
+      );
     case "darwin":
-      return path.join(os.homedir(), "Library", "Application Support", appName);
+      return path.join(os.homedir(), "Library", "Application Support", APP_NAME);
     default:
-      return path.join(os.homedir(), ".local", "share", appName);
+      return path.join(os.homedir(), ".local", "share", APP_NAME);
   }
+}
+
+function getPlatformAppDataRoot() {
+  if (process.platform === "win32") {
+    return process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support");
+  }
+  return process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+}
+
+function getMinecraftDir() {
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "minecraft");
+  }
+  if (process.platform === "win32") {
+    return path.join(getPlatformAppDataRoot(), ".minecraft");
+  }
+  return path.join(os.homedir(), ".minecraft");
 }
 
 const ACCOUNTS_DIR = getDataDir();
@@ -52,11 +87,19 @@ function listAccountUUIDs() {
   if (!fs.existsSync(ACCOUNTS_DIR)) return [];
   return fs
     .readdirSync(ACCOUNTS_DIR)
-    .filter((f) => fs.statSync(path.join(ACCOUNTS_DIR, f)).isDirectory());
+    .filter(
+      (f) =>
+        UUID_RE.test(f) &&
+        fs.statSync(path.join(ACCOUNTS_DIR, f)).isDirectory(),
+    );
 }
 
 function metaPath(uuid) {
   return path.join(ACCOUNTS_DIR, uuid, "meta.json");
+}
+
+function sourceSessionPath(uuid) {
+  return path.join(ACCOUNTS_DIR, uuid, "source-session.json");
 }
 
 function readMeta(uuid) {
@@ -68,7 +111,21 @@ function readMeta(uuid) {
 }
 
 function writeMeta(uuid, data) {
+  ensureAccountDir(uuid);
   fs.writeFileSync(metaPath(uuid), JSON.stringify(data, null, 2));
+}
+
+function readSourceSession(uuid) {
+  try {
+    return JSON.parse(fs.readFileSync(sourceSessionPath(uuid), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeSourceSession(uuid, data) {
+  ensureAccountDir(uuid);
+  fs.writeFileSync(sourceSessionPath(uuid), JSON.stringify(data, null, 2));
 }
 
 function ensureAccountDir(uuid) {
@@ -92,32 +149,420 @@ function tokenDirForUUID(uuid) {
 }
 
 // -- Cache validity -----------------------------------------------------------
-function isCacheValid(uuid) {
-  const tokenDir = tokenDirForUUID(uuid);
-  if (!fs.existsSync(tokenDir)) return false;
+function normalizeUUID(value) {
+  return String(value || "")
+    .replace(/-/g, "")
+    .toLowerCase();
+}
 
-  const files = fs
+function formatUUID(value) {
+  const stripped = normalizeUUID(value);
+  if (stripped.length !== 32) return value;
+  return `${stripped.slice(0, 8)}-${stripped.slice(8, 12)}-${stripped.slice(12, 16)}-${stripped.slice(16, 20)}-${stripped.slice(20)}`;
+}
+
+function decodeJwtPayload(token) {
+  try {
+    const payload = String(token || "").split(".")[1];
+    if (!payload) return null;
+    const padded = payload
+      .replace(/-/g, "+")
+      .replace(/_/g, "/")
+      .padEnd(Math.ceil(payload.length / 4) * 4, "=");
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function getTokenProfileUUID(mca) {
+  const payload = decodeJwtPayload(mca?.access_token);
+  if (!payload) return null;
+  if (payload?.profiles?.mc) return formatUUID(payload.profiles.mc);
+
+  const profile = Array.isArray(payload.pfd)
+    ? payload.pfd.find((entry) => entry?.type === "mc" && entry?.id)
+    : null;
+  return profile?.id ? formatUUID(profile.id) : null;
+}
+
+function getTokenProfileName(mca) {
+  const payload = decodeJwtPayload(mca?.access_token);
+  if (!payload) return null;
+
+  const profile = Array.isArray(payload.pfd)
+    ? payload.pfd.find((entry) => entry?.type === "mc" && entry?.name)
+    : null;
+  return profile?.name || null;
+}
+
+function mcaTokenMatchesAccount(mca, uuid) {
+  const tokenUUID = getTokenProfileUUID(mca);
+  return !tokenUUID || normalizeUUID(tokenUUID) === normalizeUUID(uuid);
+}
+
+function isMcaTokenUnexpired(mca) {
+  const obtainedOn = Number(mca?.obtainedOn);
+  const expiresIn = Number(mca?.expires_in);
+  if (!Number.isFinite(obtainedOn) || !Number.isFinite(expiresIn)) {
+    return false;
+  }
+  return obtainedOn + expiresIn * 1000 > Date.now() + CACHE_EXPIRY_SKEW_MS;
+}
+
+function readCacheJson(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function collectMcaTokens(tokenDir) {
+  return fs
     .readdirSync(tokenDir)
-    .filter((f) => f.endsWith("_mca-cache.json"));
+    .filter((f) => f.endsWith("_mca-cache.json"))
+    .flatMap((filename) => {
+      const data = readCacheJson(path.join(tokenDir, filename));
+      if (!data) return [];
 
-  for (const filename of files) {
-    try {
-      const data = JSON.parse(
-        fs.readFileSync(path.join(tokenDir, filename), "utf8"),
-      );
       const candidates = [];
       if (data?.mca) candidates.push(data.mca);
       for (const [key, val] of Object.entries(data)) {
         if (key !== "mca" && val?.mca) candidates.push(val.mca);
       }
-      for (const mca of candidates) {
-        if (mca.obtainedOn + mca.expires_in * 1000 > Date.now()) return true;
+      return candidates;
+    });
+}
+
+function hasMicrosoftRefreshToken(tokenDir) {
+  return fs
+    .readdirSync(tokenDir)
+    .filter(
+      (filename) =>
+        filename.endsWith("_live-cache.json") ||
+        filename.endsWith("_msal-cache.json"),
+    )
+    .some((filename) => {
+      const data = readCacheJson(path.join(tokenDir, filename));
+      return Boolean(data?.token?.refresh_token);
+    });
+}
+
+function uniqueExistingFiles(candidates) {
+  const seen = new Set();
+  return candidates
+    .filter(Boolean)
+    .map((candidate) => path.resolve(candidate))
+    .filter((candidate) => {
+      if (seen.has(candidate) || !fs.existsSync(candidate)) return false;
+      seen.add(candidate);
+      return fs.statSync(candidate).isFile();
+    });
+}
+
+function parseJsonFile(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    throw new Error(`${filePath}: ${error.message}`);
+  }
+}
+
+function fromHome(...segments) {
+  return path.join(os.homedir(), ...segments);
+}
+
+function lunarAccountsCandidates() {
+  const candidates = [
+    fromHome(".lunarclient", "settings", "game", "accounts.json"),
+  ];
+
+  if (process.platform === "darwin") {
+    candidates.unshift(
+      fromHome(
+        "Library",
+        "Application Support",
+        "lunarclient",
+        "settings",
+        "game",
+        "accounts.json",
+      ),
+    );
+  }
+
+  return candidates;
+}
+
+function vanillaAccountsCandidates() {
+  return [
+    path.join(getMinecraftDir(), "launcher_accounts.json"),
+    path.join(getMinecraftDir(), "launcher_accounts_microsoft_store.json"),
+  ];
+}
+
+function iasAccountsCandidates() {
+  return [path.join(getMinecraftDir(), "config", "ias.json")];
+}
+
+function accountSourceFiles() {
+  return [
+    {
+      id: "lunar",
+      label: "Lunar Client",
+      parser: "launcher-json",
+      paths: lunarAccountsCandidates(),
+    },
+    {
+      id: "vanilla",
+      label: "Minecraft Launcher",
+      parser: "launcher-json",
+      paths: vanillaAccountsCandidates(),
+    },
+    {
+      id: "ias",
+      label: "In-Game Account Switcher",
+      parser: "ias-json",
+      paths: iasAccountsCandidates(),
+    },
+  ].flatMap((source) =>
+    uniqueExistingFiles(source.paths).map((filePath) => ({
+      ...source,
+      path: filePath,
+      paths: undefined,
+    })),
+  );
+}
+
+function undashUUID(value) {
+  return String(value || "").replace(/-/g, "");
+}
+
+function isAccessTokenFresh(expiresAt) {
+  if (!expiresAt) return true;
+  const expires = new Date(expiresAt).getTime();
+  return Number.isFinite(expires) && expires > Date.now() + CACHE_EXPIRY_SKEW_MS;
+}
+
+function launcherSourceAccounts(source, parsed) {
+  return Object.entries(parsed?.accounts || {})
+    .map(([localId, account]) => {
+      const profile = account?.minecraftProfile || {};
+      const uuid = formatUUID(profile.id);
+      if (!UUID_RE.test(uuid) || !profile.name || !account?.accessToken) {
+        return null;
       }
+
+      return {
+        uuid,
+        ign: profile.name,
+        accessToken: account.accessToken,
+        expiresAt: account.accessTokenExpiresAt || null,
+        sourceId: source.id,
+        sourceLabel: source.label,
+        sourcePath: source.path,
+        active: String(localId) === String(parsed?.activeAccountLocalId || ""),
+        valid: isAccessTokenFresh(account.accessTokenExpiresAt),
+      };
+    })
+    .filter(Boolean);
+}
+
+function iasSourceAccounts(source, parsed) {
+  return (parsed?.accounts || [])
+    .map((account, index) => {
+      const uuid = formatUUID(account?.uuid);
+      if (!UUID_RE.test(uuid) || !account?.name || !account?.accessToken) {
+        return null;
+      }
+
+      return {
+        uuid,
+        ign: account.name,
+        accessToken: account.accessToken,
+        expiresAt: null,
+        sourceId: source.id,
+        sourceLabel: source.label,
+        sourcePath: source.path,
+        active: index === 0,
+        valid: account.isValid !== false,
+      };
+    })
+    .filter(Boolean);
+}
+
+function readSourceAccounts(source) {
+  const parsed = parseJsonFile(source.path);
+
+  if (source.parser === "launcher-json") {
+    return launcherSourceAccounts(source, parsed);
+  }
+
+  if (source.parser === "ias-json") {
+    return iasSourceAccounts(source, parsed);
+  }
+
+  return [];
+}
+
+function sourceAccountScore(account) {
+  return [
+    account.valid ? 1 : 0,
+    account.active ? 1 : 0,
+    account.expiresAt ? new Date(account.expiresAt).getTime() || 0 : Number.MAX_SAFE_INTEGER,
+    getFileMtime(account.sourcePath),
+  ];
+}
+
+function getFileMtime(filePath) {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function compareSourceAccountScore(left, right) {
+  const leftScore = sourceAccountScore(left);
+  const rightScore = sourceAccountScore(right);
+  for (let i = 0; i < leftScore.length; i++) {
+    if (leftScore[i] !== rightScore[i]) return leftScore[i] - rightScore[i];
+  }
+  return 0;
+}
+
+function uniqueLabels(labels) {
+  return [...new Set(labels.filter(Boolean))];
+}
+
+function buildSourceAccountGroups() {
+  const groups = new Map();
+
+  for (const source of accountSourceFiles()) {
+    let accounts = [];
+    try {
+      accounts = readSourceAccounts(source);
     } catch {
-      /* corrupt */
+      continue;
+    }
+
+    for (const account of accounts) {
+      if (!groups.has(account.uuid)) groups.set(account.uuid, []);
+      groups.get(account.uuid).push(account);
     }
   }
-  return false;
+
+  return groups;
+}
+
+function sourceSessionIsValid(session, uuid) {
+  return Boolean(
+    session?.session?.accessToken &&
+      session?.session?.selectedProfile?.id &&
+      normalizeUUID(session.session.selectedProfile.id) === normalizeUUID(uuid) &&
+      isAccessTokenFresh(session.expiresAt),
+  );
+}
+
+function getSourceStatus(uuid) {
+  const session = readSourceSession(uuid);
+  if (!session) return { valid: false, reason: "missing" };
+  return {
+    valid: sourceSessionIsValid(session, uuid),
+    reason: sourceSessionIsValid(session, uuid) ? "source-token" : "expired",
+  };
+}
+
+let sourceAccountsSynced = false;
+function syncSourceAccounts() {
+  if (sourceAccountsSynced) return 0;
+  sourceAccountsSynced = true;
+
+  let imported = 0;
+  for (const [uuid, accounts] of buildSourceAccountGroups()) {
+    const usable = accounts
+      .filter((account) => account.valid)
+      .sort((left, right) => compareSourceAccountScore(right, left));
+    const best = usable[0] || accounts.sort((left, right) => compareSourceAccountScore(right, left))[0];
+    if (!best) continue;
+
+    const sourceLabels = uniqueLabels(accounts.map((account) => account.sourceLabel));
+    const previousMeta = readMeta(uuid) || { uuid };
+    const previousLabels = uniqueLabels(previousMeta.sourceLabels || []);
+    const nextLabels = uniqueLabels([...previousLabels, ...sourceLabels]);
+    writeMeta(uuid, {
+      ...previousMeta,
+      uuid,
+      ignAtAdd: previousMeta.ignAtAdd || best.ign,
+      sourceLabels: nextLabels,
+    });
+
+    if (best.valid) {
+      writeSourceSession(uuid, {
+        uuid,
+        ign: best.ign,
+        expiresAt: best.expiresAt,
+        updatedAt: new Date().toISOString(),
+        selectedSource: {
+          id: best.sourceId,
+          label: best.sourceLabel,
+          path: best.sourcePath,
+        },
+        sources: sourceLabels.map((label) => ({ label })),
+        session: {
+          accessToken: best.accessToken,
+          selectedProfile: {
+            id: undashUUID(uuid),
+            name: best.ign,
+          },
+          availableProfiles: [
+            {
+              id: undashUUID(uuid),
+              name: best.ign,
+            },
+          ],
+        },
+      });
+    }
+
+    if (nextLabels.length !== previousLabels.length || !previousMeta.uuid) {
+      imported++;
+    }
+  }
+
+  return imported;
+}
+
+function syncAndReportSourceAccounts() {
+  const imported = syncSourceAccounts();
+  if (imported > 0) {
+    console.log(`  Imported ${imported} account(s) from launcher source files.`);
+  }
+}
+
+function getCacheStatus(uuid) {
+  const tokenDir = tokenDirForUUID(uuid);
+  if (!fs.existsSync(tokenDir)) {
+    return { valid: false, reason: "missing" };
+  }
+
+  const mcaTokens = collectMcaTokens(tokenDir);
+  const hasWrongAccountToken = mcaTokens.some(
+    (mca) => !mcaTokenMatchesAccount(mca, uuid),
+  );
+  if (hasWrongAccountToken) {
+    return { valid: false, reason: "wrong-account" };
+  }
+
+  if (mcaTokens.some(isMcaTokenUnexpired)) {
+    return { valid: true, reason: "minecraft-token" };
+  }
+
+  if (hasMicrosoftRefreshToken(tokenDir)) {
+    return { valid: true, reason: "refresh-token" };
+  }
+
+  return { valid: false, reason: "expired-or-empty" };
 }
 
 // -- Mojang API ---------------------------------------------------------------
@@ -157,43 +602,142 @@ async function fetchProfileFromIGN(ign) {
       `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(ign)}`,
     );
     if (!data?.id || !data?.name) return null;
-    const s = data.id;
-    const uuid = `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20)}`;
+    const uuid = formatUUID(data.id);
     return { uuid, ign: data.name };
   } catch {
     return null;
   }
 }
 
-async function buildAccountList() {
-  const uuids = listAccountUUIDs();
-  console.log("  Fetching account info...");
-  return Promise.all(
-    uuids.map(async (uuid) => {
-      const meta = readMeta(uuid);
-      const valid = isCacheValid(uuid);
-      const liveIGN = await fetchIGN(uuid);
-      const ign = liveIGN ?? meta?.ignAtAdd ?? uuid;
-      if (liveIGN && meta) writeMeta(uuid, { ...meta, ignAtAdd: liveIGN });
-      return { uuid, ign, valid };
-    }),
+function describeCacheStatus(status) {
+  if (status.valid) return "VALID";
+  if (status.reason === "wrong-account") return "WRONG ACCOUNT";
+  return "INVALID";
+}
+
+function describeAccountStatus(account) {
+  if (account.valid) return "VALID";
+  if (account.cacheStatus?.reason === "wrong-account") return "WRONG ACCOUNT";
+  return "INVALID";
+}
+
+function getAccountSourceLabels(uuid, cacheStatus) {
+  const meta = readMeta(uuid) || {};
+  const sourceSession = readSourceSession(uuid);
+  const labels = [
+    ...(Array.isArray(meta.sourceLabels) ? meta.sourceLabels : []),
+    ...(Array.isArray(sourceSession?.sources)
+      ? sourceSession.sources.map((source) => source.label)
+      : []),
+  ];
+
+  if (cacheStatus.valid) labels.push("ReplayFiller Microsoft");
+  return uniqueLabels(labels);
+}
+
+function formatSourceLabels(labels) {
+  return labels.length > 0 ? labels.join(", ") : "No imported source";
+}
+
+function printMenuBox(title, rows) {
+  const content = rows.map((row) => `  ${row}`);
+  const width = Math.max(title.length + 4, ...content.map((row) => row.length));
+  const titleLine = `-- ${title} ${"-".repeat(Math.max(1, width - title.length - 4))}`;
+  const bottomLine = "-".repeat(width);
+
+  console.log(`\n${titleLine}`);
+  content.forEach((row) => console.log(row));
+  console.log(bottomLine);
+}
+
+function createAuthFlow(uuid, { forceRefresh = false } = {}) {
+  const cacheDir = tokenDirForUUID(uuid);
+  if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+
+  return new Authflow(
+    AUTH_CACHE_USERNAME,
+    cacheDir,
+    { ...AUTH_FLOW_OPTIONS, forceRefresh },
+    (data) => {
+      const url = `${data.verification_uri}?otc=${data.user_code}`;
+      console.log("\nMicrosoft authentication required.");
+      console.log(`Open: ${url}`);
+      console.log(`Code: ${data.user_code}\n`);
+    },
   );
 }
 
+async function authenticateAccount(account, { forceRefresh = false } = {}) {
+  const flow = createAuthFlow(account.uuid, { forceRefresh });
+  const { profile } = await flow.getMinecraftJavaToken({ fetchProfile: true });
+  if (!profile?.id || !profile?.name) {
+    throw new Error("Microsoft login did not return a Minecraft profile.");
+  }
+
+  const profileUUID = formatUUID(profile.id);
+  if (normalizeUUID(profileUUID) !== normalizeUUID(account.uuid)) {
+    throw new Error(
+      `Authenticated as ${profile.name} (${profileUUID}), expected ${account.ign} (${account.uuid}).`,
+    );
+  }
+
+  const meta = readMeta(account.uuid) || { uuid: account.uuid };
+  writeMeta(account.uuid, {
+    ...meta,
+    uuid: account.uuid,
+    ignAtAdd: profile.name,
+  });
+  return { ...account, ign: profile.name };
+}
+
+async function buildAccountList() {
+  const uuids = listAccountUUIDs();
+  console.log("  Fetching account info...");
+  const accounts = await Promise.all(
+    uuids.map(async (uuid) => {
+      const meta = readMeta(uuid);
+      const cacheStatus = getCacheStatus(uuid);
+      const sourceStatus = getSourceStatus(uuid);
+      const liveIGN = await fetchIGN(uuid);
+      const ign = liveIGN ?? meta?.ignAtAdd ?? uuid;
+      if (liveIGN && meta) writeMeta(uuid, { ...meta, ignAtAdd: liveIGN });
+      const valid = cacheStatus.valid || sourceStatus.valid;
+      return {
+        uuid,
+        ign,
+        valid,
+        cacheStatus,
+        sourceStatus,
+        sources: getAccountSourceLabels(uuid, cacheStatus),
+      };
+    }),
+  );
+
+  return accounts.sort((left, right) => {
+    if (left.valid !== right.valid) return left.valid ? -1 : 1;
+    return left.ign.localeCompare(right.ign, undefined, {
+      sensitivity: "base",
+      numeric: true,
+    });
+  });
+}
+
 // -- Bot worker ---------------------------------------------------------------
-function runBot(account) {
-  const accountDir = path.join(ACCOUNTS_DIR, account.uuid);
+function runBot(account, loopTarget) {
+  const cacheDir = tokenDirForUUID(account.uuid);
+  const sourcePath = sourceSessionPath(account.uuid);
 
   const env = {
-  ...process.env,
-  HOME: accountDir,
-  APPDATA: accountDir,
-  RF_UUID: account.uuid,
-  RF_IGN: account.ign,
-  RF_ACCOUNTS_DIR: ACCOUNTS_DIR,
-  RF_WORKER: "1",
-  NODE_OPTIONS: "--no-experimental-fetch",
-};
+    ...process.env,
+    RF_UUID: account.uuid,
+    RF_IGN: account.ign,
+    RF_ACCOUNTS_DIR: ACCOUNTS_DIR,
+    RF_AUTH_CACHE_DIR: cacheDir,
+    RF_AUTH_USERNAME: AUTH_CACHE_USERNAME,
+    RF_SOURCE_SESSION_PATH: sourcePath,
+    RF_LOOP_TARGET: String(loopTarget),
+    RF_WORKER: "1",
+  };
 
   rl.close();
   process.stdin.pause();
@@ -218,6 +762,26 @@ function runBot(account) {
 }
 
 // -- Menus --------------------------------------------------------------------
+async function askLoopTarget() {
+  const input = (
+    await ask(`Loop count (Enter for ${DEFAULT_LOOP_TARGET}): `)
+  )
+    .trim()
+    .toLowerCase();
+
+  if (input === "" || input === "default" || input === "d") {
+    return DEFAULT_LOOP_TARGET;
+  }
+
+  const target = Number(input);
+  if (!Number.isSafeInteger(target) || target < 1) {
+    console.log("Loop count must be a positive whole number.");
+    return askLoopTarget();
+  }
+
+  return target;
+}
+
 async function mainMenu() {
   console.log("\n==================================");
   console.log("       ReplayFill  -  Main Menu   ");
@@ -247,6 +811,8 @@ async function mainMenu() {
 }
 
 async function selectAccountMenu() {
+  syncAndReportSourceAccounts();
+
   if (listAccountUUIDs().length === 0) {
     console.log("\nNo accounts saved yet. Add one first.");
     return mainMenu();
@@ -254,13 +820,13 @@ async function selectAccountMenu() {
 
   const accounts = await buildAccountList();
 
-  console.log("\n-- Select Account -----------------------------");
-  accounts.forEach((acc, i) => {
-    const status = acc.valid ? "[VALID]" : "[INVALID]";
-    console.log(`  ${i + 1}) ${acc.ign.padEnd(20)} ${status}`);
+  const rows = accounts.map((acc, i) => {
+    const status = `[${describeAccountStatus(acc)}]`;
+    const sources = `[${formatSourceLabels(acc.sources)}]`;
+    return `${i + 1}) ${acc.ign.padEnd(20)} ${status} ${sources}`;
   });
-  console.log("  0) Back");
-  console.log("-----------------------------------------------");
+  rows.push("0) Back");
+  printMenuBox("Select Account", rows);
 
   const input = (await ask("Choice: ")).trim();
   const idx = parseInt(input, 10);
@@ -271,20 +837,28 @@ async function selectAccountMenu() {
     return selectAccountMenu();
   }
 
-  const chosen = accounts[idx - 1];
+  let chosen = accounts[idx - 1];
   if (!chosen.valid) {
-    console.log(
-      "Warning: cache is INVALID -- you will be prompted to log in via Microsoft again.",
-    );
+    console.log("Cache is invalid. Starting Microsoft login before launch...");
+    try {
+      chosen = await authenticateAccount(chosen, { forceRefresh: true });
+      console.log(`Authenticated as ${chosen.ign}.`);
+    } catch (error) {
+      console.log(`Authentication failed: ${error.message}`);
+      return selectAccountMenu();
+    }
   }
+  const loopTarget = await askLoopTarget();
   console.log(
-    `\nStarting bot as ${chosen.ign}... (type "help" for runtime commands)\n`,
+    `\nStarting bot as ${chosen.ign} for ${loopTarget} loop(s)... (type "help" for runtime commands)\n`,
   );
 
-  runBot(chosen);
+  runBot(chosen, loopTarget);
 }
 
 async function addAccountMenu() {
+  syncSourceAccounts();
+
   console.log("\n-- Add Account --------------------------------");
   console.log("Enter the Minecraft IGN of the account to add.");
   const rawIGN = (await ask("IGN: ")).trim();
@@ -319,6 +893,8 @@ async function addAccountMenu() {
 }
 
 async function deleteAccountMenu() {
+  syncAndReportSourceAccounts();
+
   if (listAccountUUIDs().length === 0) {
     console.log("\nNo accounts to delete.");
     return mainMenu();
@@ -326,13 +902,13 @@ async function deleteAccountMenu() {
 
   const accounts = await buildAccountList();
 
-  console.log("\n-- Delete Account -----------------------------");
-  accounts.forEach((acc, i) => {
-    const status = acc.valid ? "[VALID]" : "[INVALID]";
-    console.log(`  ${i + 1}) ${acc.ign.padEnd(20)} ${status}`);
+  const rows = accounts.map((acc, i) => {
+    const status = `[${describeAccountStatus(acc)}]`;
+    const sources = `[${formatSourceLabels(acc.sources)}]`;
+    return `${i + 1}) ${acc.ign.padEnd(20)} ${status} ${sources}`;
   });
-  console.log("  0) Back");
-  console.log("-----------------------------------------------");
+  rows.push("0) Back");
+  printMenuBox("Delete Account", rows);
 
   const input = (await ask("Choice: ")).trim();
   const idx = parseInt(input, 10);

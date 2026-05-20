@@ -67,7 +67,7 @@ Binaries are output to the `dist/` folder. The build targets Node.js 18 and prod
 Accounts are managed through the interactive menu at startup:
 
 - **Add new account** - enter the Minecraft IGN of the account to add. The UUID is looked up automatically via the Mojang API and the account is stored under that UUID. On first use you will be prompted to log in via Microsoft; the token is then cached locally for future runs.
-- **Select account & start** - pick a saved account to begin the replay fill loop. Each account displays its current IGN (refreshed live from Mojang) alongside a `[VALID]` or `[INVALID]` status indicating whether the cached login token is still usable. Selecting an `[INVALID]` account will trigger a Microsoft re-login.
+- **Select account & start** - pick a saved account to begin the replay fill loop. Each account displays its current IGN (refreshed live from Mojang) alongside a cache status. `[VALID]` means ReplayFiller found either a current Minecraft access token, a usable source session, or a Microsoft refresh token that can refresh it. Selecting an `[INVALID]` account will complete Microsoft login before the bot launches. Before launch, you can enter how many times the loop should run, or press Enter to use the default of 600.
 - **Delete account** - permanently removes an account and all of its cached tokens.
 
 Account data is stored in an OS-native location created automatically at runtime:
@@ -87,6 +87,8 @@ ReplayFiller/
 ```
 
 Each account's tokens are fully isolated so switching accounts always uses the correct credentials.
+
+When the account menu opens, ReplayFiller scans default account source paths, including Lunar Client `accounts.json`, Minecraft Launcher account files, and IAS `ias.json`. Any recognizable Minecraft profile gets a ReplayFiller account folder, and usable source sessions are saved there for launching.
 
 IGNs are always fetched fresh from Mojang when the menu loads, so name changes are reflected automatically. The last known IGN is also saved in `meta.json` as a fallback when offline.
 
