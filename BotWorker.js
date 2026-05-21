@@ -33,6 +33,7 @@ const fs = require("fs");
 const { Titles } = require("prismarine-auth");
 
 const DEFAULT_LOOP_TARGET = 600;
+const REJOIN_DELAY_MS = 5000;
 
 // -- Config -------------------------------------------------------------------
 async function startBotWorker() {
@@ -43,6 +44,7 @@ async function startBotWorker() {
   const authUsername = process.env.RF_AUTH_USERNAME || "Player";
   const sourceSessionFile = process.env.RF_SOURCE_SESSION_PATH;
   const loopTarget = parseLoopTarget(process.env.RF_LOOP_TARGET);
+  const debugDisconnects = process.env.RF_DEBUG_DISCONNECTS === "1";
 
   const mineflayer = require("mineflayer");
 
@@ -58,10 +60,13 @@ async function startBotWorker() {
   let bot = null;
   let currentInterval = null;
   let spawnTimeout = null;
+  let reconnectTimeout = null;
   let count = 0;
   let isPaused = false;
+  let isBanned = false;
   let authMismatch = false;
   let usingSourceAuth = false;
+  let connectionAttempt = 0;
 
 // -- Helpers ------------------------------------------------------------------
   function parseLoopTarget(value) {
@@ -103,6 +108,37 @@ async function startBotWorker() {
     }
   }
 
+  function clearReconnect() {
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
+      reconnectTimeout = null;
+    }
+  }
+
+  function canReconnect() {
+    return !isPaused && !isBanned && !authMismatch && count < loopTarget;
+  }
+
+  function scheduleReconnect(reason) {
+    clearLoop();
+    if (!canReconnect() || reconnectTimeout) return;
+
+    const suffix = reason ? ` after ${reason}` : "";
+    console.log(`[${ign}] Rejoining in ${REJOIN_DELAY_MS / 1000} seconds${suffix}...`);
+    reconnectTimeout = setTimeout(() => {
+      reconnectTimeout = null;
+      if (!canReconnect()) return;
+      bot = null;
+      console.log(`[${ign}] Rejoining now...`);
+      createBot();
+    }, REJOIN_DELAY_MS);
+  }
+
+  function logDebug(message) {
+    if (!debugDisconnects) return;
+    console.log(`[${ign}] Debug: ${message}`);
+  }
+
   function clearTokenCache() {
     const tDir = tokenDir();
     if (fs.existsSync(tDir)) {
@@ -136,6 +172,193 @@ async function startBotWorker() {
     if (!expiresAt) return true;
     const expires = new Date(expiresAt).getTime();
     return Number.isFinite(expires) && expires > Date.now() + 30_000;
+  }
+
+  function metaFilePath() {
+    return path.join(ACCOUNTS_DIR, uuid, "meta.json");
+  }
+
+  function readWorkerMeta() {
+    try {
+      return JSON.parse(fs.readFileSync(metaFilePath(), "utf8"));
+    } catch {
+      return {};
+    }
+  }
+
+  function writeWorkerMeta(meta) {
+    const accountDir = path.join(ACCOUNTS_DIR, uuid);
+    fs.mkdirSync(accountDir, { recursive: true });
+    fs.writeFileSync(metaFilePath(), JSON.stringify(meta, null, 2));
+  }
+
+  function writeBanStatus(banStatus) {
+    const meta = readWorkerMeta();
+    writeWorkerMeta({
+      ...meta,
+      uuid,
+      ignAtAdd: meta.ignAtAdd || ign,
+      banStatus,
+    });
+  }
+
+  function clearBanStatus() {
+    const meta = readWorkerMeta();
+    if (!meta.banStatus) return;
+    delete meta.banStatus;
+    writeWorkerMeta(meta);
+  }
+
+  function parseJsonString(value) {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+
+  function extractKickText(value, seen = new Set(), depth = 0) {
+    if (value == null || depth > 8) return "";
+
+    if (typeof value === "string") {
+      const parsed = parseJsonString(value);
+      return parsed ? extractKickText(parsed, seen, depth + 1) : value;
+    }
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+
+    if (typeof value !== "object") return "";
+    if (seen.has(value)) return "";
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      return value
+        .map((entry) => extractKickText(entry, seen, depth + 1))
+        .filter(Boolean)
+        .join(" ");
+    }
+
+    const preferredParts = ["text", "translate", "extra", "with", "value", "json"]
+      .filter((key) => Object.prototype.hasOwnProperty.call(value, key))
+      .map((key) => extractKickText(value[key], seen, depth + 1))
+      .filter(Boolean);
+    if (preferredParts.length > 0) return preferredParts.join(" ");
+
+    if (
+      typeof value.toString === "function" &&
+      value.toString !== Object.prototype.toString
+    ) {
+      const text = value.toString();
+      if (text && text !== "[object Object]") return text;
+    }
+
+    return Object.values(value)
+      .map((entry) => extractKickText(entry, seen, depth + 1))
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  function normalizeKickText(reason) {
+    return extractKickText(reason)
+      .replace(/\u00a7[0-9a-fk-or]/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function parseBanDurationMs(durationText) {
+    const unitMs = {
+      d: 24 * 60 * 60 * 1000,
+      day: 24 * 60 * 60 * 1000,
+      days: 24 * 60 * 60 * 1000,
+      h: 60 * 60 * 1000,
+      hour: 60 * 60 * 1000,
+      hours: 60 * 60 * 1000,
+      m: 60 * 1000,
+      min: 60 * 1000,
+      mins: 60 * 1000,
+      minute: 60 * 1000,
+      minutes: 60 * 1000,
+      s: 1000,
+      sec: 1000,
+      secs: 1000,
+      second: 1000,
+      seconds: 1000,
+    };
+    const re = /(\d+)\s*(d|days?|h|hours?|m|mins?|minutes?|s|secs?|seconds?)/gi;
+    let total = 0;
+    let match;
+
+    while ((match = re.exec(durationText)) !== null) {
+      total += Number(match[1]) * unitMs[match[2].toLowerCase()];
+    }
+
+    return total > 0 ? total : null;
+  }
+
+  function detectBanStatus(reasonText) {
+    if (!reasonText) return null;
+
+    if (
+      /account has been blocked/i.test(reasonText) &&
+      /suspicious activity/i.test(reasonText)
+    ) {
+      return {
+        type: "security",
+        label: "SEC BAN",
+        until: null,
+        lastSeenAt: new Date().toISOString(),
+        raw: reasonText,
+      };
+    }
+
+    const tempMatch = reasonText.match(
+      /temporarily banned for\s+(.+?)\s+from this server/i,
+    );
+    if (!tempMatch) return null;
+
+    const durationText = tempMatch[1].trim();
+    const durationMs = parseBanDurationMs(durationText);
+    return {
+      type: "temporary",
+      label: `BAN - ${durationText}`,
+      durationText,
+      until: durationMs ? new Date(Date.now() + durationMs).toISOString() : null,
+      lastSeenAt: new Date().toISOString(),
+      raw: reasonText,
+    };
+  }
+
+  function handleDisconnectReason(source, reason, activeBot) {
+    const reasonText = normalizeKickText(reason);
+    logDebug(`${source}: ${reasonText || "<no disconnect message>"}`);
+
+    const banStatus = detectBanStatus(reasonText);
+    if (!banStatus) return false;
+
+    handleBanStatus(banStatus, activeBot);
+    return true;
+  }
+
+  function handleBanStatus(banStatus, activeBot) {
+    isBanned = true;
+    isPaused = true;
+    clearLoop();
+    clearReconnect();
+    writeBanStatus(banStatus);
+    console.log(`[${ign}] ${banStatus.label}. Returning to account manager.`);
+    if (activeBot) {
+      try {
+        activeBot.end("Ban detected");
+      } catch {
+        // The server may already have closed the connection after the kick.
+      }
+    }
+    rl.close();
+    process.exit(42);
   }
 
   function buildBotOptions(tDir) {
@@ -194,12 +417,44 @@ async function startBotWorker() {
   }
 
   function createBot() {
+    clearReconnect();
     const tDir = tokenDir();
     if (!fs.existsSync(tDir)) fs.mkdirSync(tDir, { recursive: true });
 
-    bot = mineflayer.createBot(buildBotOptions(tDir));
+    connectionAttempt++;
+    const attempt = connectionAttempt;
+    let spawnedThisAttempt = false;
+    let lastDisconnectText = "";
+    logDebug(`connect attempt #${attempt}`);
 
-    bot._client.on("session", (session) => {
+    const activeBot = mineflayer.createBot(buildBotOptions(tDir));
+    bot = activeBot;
+
+    activeBot._client.on("connect", () => {
+      logDebug(`attempt #${attempt} socket connected`);
+    });
+
+    activeBot._client.on("state", (newState, oldState) => {
+      logDebug(`attempt #${attempt} protocol state ${oldState} -> ${newState}`);
+    });
+
+    activeBot._client.on("packet", (data, meta) => {
+      if (!["disconnect", "kick_disconnect"].includes(meta?.name)) return;
+      lastDisconnectText = normalizeKickText(data?.reason ?? data);
+      handleDisconnectReason(
+        `attempt #${attempt} packet ${meta.name} (${meta.state || "unknown state"})`,
+        data?.reason ?? data,
+        activeBot,
+      );
+    });
+
+    activeBot._client.on("end", (reason) => {
+      logDebug(
+        `attempt #${attempt} client end: ${reason || "socketClosed"} | spawned=${spawnedThisAttempt} | state=${activeBot._client.state} | lastPacket=${lastDisconnectText || "none"}`,
+      );
+    });
+
+    activeBot._client.on("session", (session) => {
       const profile = session?.selectedProfile;
       if (!profile?.id) return;
 
@@ -211,36 +466,42 @@ async function startBotWorker() {
         );
         clearLoop();
         if (!usingSourceAuth) clearTokenCache();
-        bot.end("Authenticated account does not match selected account");
+        activeBot.end("Authenticated account does not match selected account");
       }
     });
 
-    bot.once("spawn", () => {
-      if (authMismatch) return;
+    activeBot.once("spawn", () => {
+      if (bot !== activeBot || authMismatch || isBanned) return;
+      spawnedThisAttempt = true;
+      clearBanStatus();
       console.log(`[${ign}] Bot spawned, waiting for Hypixel welcome...`);
       spawnTimeout = setTimeout(() => {
         if (!isPaused) startHousingLoop();
       }, 10000);
     });
 
-    bot.on("kicked", (reason) => {
-      console.log(`[${ign}] Kicked:`, reason);
-      clearLoop();
+    activeBot.on("kicked", (reason) => {
+      if (handleDisconnectReason(`attempt #${attempt} kicked event`, reason, activeBot)) return;
+      const reasonText = normalizeKickText(reason);
+      console.log(`[${ign}] Kicked: ${reasonText || "No reason provided"}`);
+      scheduleReconnect("kick");
     });
 
-    bot.on("error", (err) => {
+    activeBot.on("error", (err) => {
       console.log(`[${ign}] Error:`, err);
       clearLoop();
     });
 
-    bot.on("end", () => {
+    activeBot.on("end", () => {
       clearLoop();
-      bot = null;
+      if (bot === activeBot) bot = null;
       if (authMismatch) {
         console.log(
           `[${ign}] Stopped because the authenticated account does not match this ReplayFiller account.`,
         );
+        return;
       }
+      scheduleReconnect("disconnect");
     });
   }
 
@@ -248,6 +509,7 @@ async function startBotWorker() {
   function stopBot() {
     isPaused = true;
     clearLoop();
+    clearReconnect();
     if (bot) {
       bot.quit("Manual stop");
       bot = null;
@@ -263,6 +525,8 @@ async function startBotWorker() {
       return;
     }
     isPaused = false;
+    isBanned = false;
+    clearReconnect();
     console.log(`Resuming [${ign}]... Progress: ${count}/${loopTarget}`);
     createBot();
   }
@@ -292,6 +556,8 @@ async function startBotWorker() {
         break;
       case "quit":
       case "exit":
+        isPaused = true;
+        clearReconnect();
         if (bot) bot.quit("Manual exit");
         rl.close();
         process.exit(0);
@@ -306,6 +572,8 @@ async function startBotWorker() {
 // -- Graceful shutdown --------------------------------------------------------
   process.on("SIGINT", () => {
     console.log("\nShutting down...");
+    isPaused = true;
+    clearReconnect();
     if (bot) bot.quit("Process terminated");
     rl.close();
     process.exit(0);

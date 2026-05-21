@@ -621,6 +621,45 @@ function describeAccountStatus(account) {
   return "INVALID";
 }
 
+function formatBanDuration(ms) {
+  let remaining = Math.max(0, Math.ceil(ms / 1000));
+  const units = [
+    ["d", 24 * 60 * 60],
+    ["h", 60 * 60],
+    ["m", 60],
+    ["s", 1],
+  ];
+  const parts = [];
+
+  for (const [label, seconds] of units) {
+    const value = Math.floor(remaining / seconds);
+    remaining %= seconds;
+    if (value > 0) parts.push(`${value}${label}`);
+  }
+
+  return parts.length > 0 ? parts.join(" ") : "0s";
+}
+
+function getBanStatusLabel(meta) {
+  const banStatus = meta?.banStatus;
+  if (!banStatus) return null;
+
+  if (banStatus.type === "security") return "SEC BAN";
+
+  if (banStatus.type === "temporary") {
+    const until = banStatus.until ? new Date(banStatus.until).getTime() : null;
+    if (Number.isFinite(until)) {
+      const remaining = until - Date.now();
+      return remaining > 0
+        ? `BAN - ${formatBanDuration(remaining)}`
+        : "BAN - expired";
+    }
+    if (banStatus.durationText) return `BAN - ${banStatus.durationText}`;
+  }
+
+  return banStatus.label || null;
+}
+
 function getAccountSourceLabels(uuid, cacheStatus) {
   const meta = readMeta(uuid) || {};
   const sourceSession = readSourceSession(uuid);
@@ -637,6 +676,16 @@ function getAccountSourceLabels(uuid, cacheStatus) {
 
 function formatSourceLabels(labels) {
   return labels.length > 0 ? labels.join(", ") : "No imported source";
+}
+
+function formatAccountMenuRow(account, index) {
+  const badges = [
+    account.banLabel ? `[${account.banLabel}]` : null,
+    `[${describeAccountStatus(account)}]`,
+    `[${formatSourceLabels(account.sources)}]`,
+  ].filter(Boolean);
+
+  return `${index + 1}) ${account.ign.padEnd(20)} ${badges.join(" ")}`;
 }
 
 function printMenuBox(title, rows) {
@@ -702,10 +751,12 @@ async function buildAccountList() {
       const ign = liveIGN ?? meta?.ignAtAdd ?? uuid;
       if (liveIGN && meta) writeMeta(uuid, { ...meta, ignAtAdd: liveIGN });
       const valid = cacheStatus.valid || sourceStatus.valid;
+      const banLabel = getBanStatusLabel(meta);
       return {
         uuid,
         ign,
         valid,
+        banLabel,
         cacheStatus,
         sourceStatus,
         sources: getAccountSourceLabels(uuid, cacheStatus),
@@ -820,11 +871,7 @@ async function selectAccountMenu() {
 
   const accounts = await buildAccountList();
 
-  const rows = accounts.map((acc, i) => {
-    const status = `[${describeAccountStatus(acc)}]`;
-    const sources = `[${formatSourceLabels(acc.sources)}]`;
-    return `${i + 1}) ${acc.ign.padEnd(20)} ${status} ${sources}`;
-  });
+  const rows = accounts.map(formatAccountMenuRow);
   rows.push("0) Back");
   printMenuBox("Select Account", rows);
 
@@ -902,11 +949,7 @@ async function deleteAccountMenu() {
 
   const accounts = await buildAccountList();
 
-  const rows = accounts.map((acc, i) => {
-    const status = `[${describeAccountStatus(acc)}]`;
-    const sources = `[${formatSourceLabels(acc.sources)}]`;
-    return `${i + 1}) ${acc.ign.padEnd(20)} ${status} ${sources}`;
-  });
+  const rows = accounts.map(formatAccountMenuRow);
   rows.push("0) Back");
   printMenuBox("Delete Account", rows);
 

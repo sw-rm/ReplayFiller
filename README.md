@@ -105,6 +105,14 @@ Once the bot is running, the following commands are available:
 | `help`     | List available commands                   |
 | `quit`     | Exit the program                          |
 
+Unexpected kicks or disconnects automatically rejoin after 5 seconds. If Hypixel
+returns a security block or temporary ban during login, the loop stops, the
+account manager opens again, and the account is marked with `[SEC BAN]` or
+`[BAN - <time>]` in the account list.
+
+For detailed protocol disconnect traces while debugging, launch with
+`RF_DEBUG_DISCONNECTS=1`.
+
 ## Authors
 
 - [@sw-rm](https://github.com/sw-rm)
