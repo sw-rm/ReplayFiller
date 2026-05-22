@@ -53,7 +53,8 @@ async function startBotWorker() {
 
   const rl = readline.createInterface({
     input: process.stdin,
-    output: process.stdout,
+    output: process.stdin.isTTY ? process.stdout : undefined,
+    terminal: Boolean(process.stdin.isTTY),
   });
 
 // -- State --------------------------------------------------------------------
@@ -65,8 +66,13 @@ async function startBotWorker() {
   let isPaused = false;
   let isBanned = false;
   let authMismatch = false;
-  let usingSourceAuth = false;
   let connectionAttempt = 0;
+  let sourceAuthFailuresSeen = false;
+  let allowMicrosoftAfterSourceFailure = false;
+  let microsoftFallbackFailed = false;
+  let resolvingSourceFailure = false;
+  let sourceFailureChoiceResolver = null;
+  const failedSourceAuthKeys = new Set();
 
 // -- Helpers ------------------------------------------------------------------
   function parseLoopTarget(value) {
@@ -147,6 +153,40 @@ async function startBotWorker() {
     fs.mkdirSync(tDir, { recursive: true });
   }
 
+  function readCacheJson(filePath) {
+    try {
+      return JSON.parse(fs.readFileSync(filePath, "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  function hasCachedMcaToken(data) {
+    if (data?.mca?.access_token) return true;
+    return Object.values(data || {}).some((value) => value?.mca?.access_token);
+  }
+
+  function hasCachedMicrosoftRefreshToken(data) {
+    if (data?.token?.refresh_token) return true;
+    return Object.values(data || {}).some((value) => value?.token?.refresh_token);
+  }
+
+  function hasReplayFillerMicrosoftCache(tDir) {
+    if (!fs.existsSync(tDir)) return false;
+    return fs
+      .readdirSync(tDir)
+      .filter(
+        (filename) =>
+          filename.endsWith("_mca-cache.json") ||
+          filename.endsWith("_live-cache.json") ||
+          filename.endsWith("_msal-cache.json"),
+      )
+      .some((filename) => {
+        const data = readCacheJson(path.join(tDir, filename));
+        return hasCachedMcaToken(data) || hasCachedMicrosoftRefreshToken(data);
+      });
+  }
+
   function readSourceSession() {
     try {
       return JSON.parse(fs.readFileSync(sourceSessionFile, "utf8"));
@@ -155,16 +195,54 @@ async function startBotWorker() {
     }
   }
 
-  function isSourceSessionValid(session) {
+  function getSourceSessionEntries(sourceSession) {
+    if (Array.isArray(sourceSession?.sourceSessions)) {
+      return sourceSession.sourceSessions;
+    }
+    return sourceSession?.session ? [sourceSession] : [];
+  }
+
+  function sourceCandidateLabel(candidate) {
+    return candidate?.selectedSource?.label || "source";
+  }
+
+  function sourceCandidateKey(candidate) {
+    const selectedSource = candidate?.selectedSource || {};
+    const profile = candidate?.session?.selectedProfile || {};
+    const tokenTail = String(candidate?.session?.accessToken || "").slice(-16);
+    return [
+      candidate.index,
+      selectedSource.id || "",
+      selectedSource.path || "",
+      profile.id || "",
+      profile.name || "",
+      tokenTail,
+    ].join("|");
+  }
+
+  function sourceCandidateFromEntry(entry, index, sourceSession) {
+    const selectedSource = entry?.selectedSource || sourceSession?.selectedSource || {};
+    const candidate = {
+      index,
+      ign: entry?.ign || sourceSession?.ign,
+      expiresAt: entry?.expiresAt ?? sourceSession?.expiresAt ?? null,
+      selectedSource,
+      session: entry?.session,
+    };
+    candidate.key = sourceCandidateKey(candidate);
+    return candidate;
+  }
+
+  function isSourceCandidateValid(candidate) {
     if (
-      !session?.session?.accessToken ||
-      !session?.session?.selectedProfile?.id
+      !candidate?.session?.accessToken ||
+      !candidate?.session?.selectedProfile?.id
     ) {
       return false;
     }
     return (
-      normalizeUUID(session.session.selectedProfile.id) === normalizeUUID(uuid) &&
-      isAccessTokenFresh(session.expiresAt)
+      normalizeUUID(candidate.session.selectedProfile.id) === normalizeUUID(uuid) &&
+      isAccessTokenFresh(candidate.expiresAt)
     );
   }
 
@@ -172,6 +250,35 @@ async function startBotWorker() {
     if (!expiresAt) return true;
     const expires = new Date(expiresAt).getTime();
     return Number.isFinite(expires) && expires > Date.now() + 30_000;
+  }
+
+  function getSourceAuthCandidates() {
+    const sourceSession = readSourceSession();
+    const candidates = getSourceSessionEntries(sourceSession)
+      .map((entry, index) => sourceCandidateFromEntry(entry, index, sourceSession))
+      .filter(isSourceCandidateValid);
+
+    return candidates.map((candidate, index) => ({
+      ...candidate,
+      position: index + 1,
+      total: candidates.length,
+    }));
+  }
+
+  function selectSourceAuthCandidate() {
+    return getSourceAuthCandidates().find(
+      (candidate) => !failedSourceAuthKeys.has(candidate.key),
+    );
+  }
+
+  function hasUntriedSourceAuthCandidate() {
+    return Boolean(selectSourceAuthCandidate());
+  }
+
+  function sourceAttemptText(candidate) {
+    const label = sourceCandidateLabel(candidate);
+    if (!candidate || candidate.total <= 1) return label;
+    return `${label} (${candidate.position}/${candidate.total})`;
   }
 
   function metaFilePath() {
@@ -361,25 +468,80 @@ async function startBotWorker() {
     process.exit(42);
   }
 
-  function buildBotOptions(tDir) {
-    const sourceSession = readSourceSession();
-    if (isSourceSessionValid(sourceSession)) {
-      usingSourceAuth = true;
-      console.log(
-        `[${ign}] Using ${sourceSession.selectedSource?.label || "source"} session.`,
-      );
+  function errorText(error) {
+    if (!error) return "";
+    if (typeof error === "string") return error;
+    return [error.name, error.message, error.stack]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  function summarizeErrorText(text) {
+    const normalized = String(text || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return normalized.length > 180
+      ? `${normalized.slice(0, 177)}...`
+      : normalized;
+  }
+
+  function isLikelySourceAuthFailure(text) {
+    return /ForbiddenOperationException|InvalidCredentialsException|invalid\s+(session|token|grant)|expired\s+token|bad\s+login|failed\s+to\s+authenticate|unauthori[sz]ed|forbidden|yggdrasil/i.test(
+      text || "",
+    );
+  }
+
+  function askSourceFailureChoice() {
+    console.log(`[${ign}] All imported account-source sessions failed.`);
+    console.log("  1) Re-login in game, then return to the account manager to rescan");
+    console.log("  2) Add/use ReplayFiller Microsoft login now");
+    process.stdout.write("Choice (1/2): ");
+    return new Promise((resolve) => {
+      sourceFailureChoiceResolver = resolve;
+    });
+  }
+
+  async function promptAfterAllSourceAuthFailed() {
+    if (resolvingSourceFailure) return;
+    resolvingSourceFailure = true;
+    isPaused = true;
+    clearLoop();
+    clearReconnect();
+
+    while (true) {
+      const choice = (await askSourceFailureChoice()).trim().toLowerCase();
+      if (["1", "r", "relogin", "ingame", "in-game", "game"].includes(choice)) {
+        rl.close();
+        process.exit(42);
+      }
+      if (["2", "m", "ms", "microsoft"].includes(choice)) {
+        allowMicrosoftAfterSourceFailure = true;
+        microsoftFallbackFailed = false;
+        resolvingSourceFailure = false;
+        isPaused = false;
+        clearTokenCache();
+        console.log(`[${ign}] Starting ReplayFiller Microsoft authentication.`);
+        createBot();
+        return;
+      }
+      console.log("Choose 1 or 2.");
+    }
+  }
+
+  function buildBotOptions(tDir, sourceCandidate) {
+    if (sourceCandidate) {
+      console.log(`[${ign}] Using ${sourceAttemptText(sourceCandidate)} session.`);
       return {
         host: "hypixel.net",
         version: "1.8.9",
-        username: sourceSession.session.selectedProfile.name,
+        username: sourceCandidate.session.selectedProfile.name,
         auth: require("minecraft-protocol/src/client/mojangAuth"),
-        session: sourceSession.session,
+        session: sourceCandidate.session,
         profilesFolder: false,
         skipValidation: true,
       };
     }
 
-    usingSourceAuth = false;
     return {
       host: "hypixel.net",
       version: "1.8.9",
@@ -421,14 +583,102 @@ async function startBotWorker() {
     const tDir = tokenDir();
     if (!fs.existsSync(tDir)) fs.mkdirSync(tDir, { recursive: true });
 
+    const sourceCandidate = selectSourceAuthCandidate();
+    if (
+      !sourceCandidate &&
+      sourceAuthFailuresSeen &&
+      !allowMicrosoftAfterSourceFailure
+    ) {
+      if (!microsoftFallbackFailed && hasReplayFillerMicrosoftCache(tDir)) {
+        allowMicrosoftAfterSourceFailure = true;
+        console.log(`[${ign}] Trying ReplayFiller Microsoft authentication.`);
+      } else {
+        promptAfterAllSourceAuthFailed();
+        return;
+      }
+    }
+
     connectionAttempt++;
     const attempt = connectionAttempt;
     let spawnedThisAttempt = false;
     let lastDisconnectText = "";
+    let sourceAuthFailureHandled = false;
+    let microsoftAuthFailureHandled = false;
     logDebug(`connect attempt #${attempt}`);
 
-    const activeBot = mineflayer.createBot(buildBotOptions(tDir));
+    const activeBot = mineflayer.createBot(buildBotOptions(tDir, sourceCandidate));
     bot = activeBot;
+
+    function handleSourceAuthFailure(reason) {
+      if (
+        sourceAuthFailureHandled ||
+        !sourceCandidate ||
+        spawnedThisAttempt ||
+        !isLikelySourceAuthFailure(reason)
+      ) {
+        return false;
+      }
+
+      sourceAuthFailureHandled = true;
+      sourceAuthFailuresSeen = true;
+      failedSourceAuthKeys.add(sourceCandidate.key);
+      clearLoop();
+      clearReconnect();
+      if (bot === activeBot) bot = null;
+
+      const summary = summarizeErrorText(reason);
+      const suffix = summary ? `: ${summary}` : ".";
+      console.log(
+        `[${ign}] ${sourceCandidateLabel(sourceCandidate)} session failed${suffix}`,
+      );
+
+      try {
+        activeBot.end("Source session failed");
+      } catch {
+        // The auth path may already have closed the connection.
+      }
+
+      setTimeout(() => {
+        if (hasUntriedSourceAuthCandidate()) {
+          console.log(`[${ign}] Trying next account source...`);
+        }
+        createBot();
+      }, 0);
+      return true;
+    }
+
+    function handleMicrosoftFallbackFailure(reason) {
+      if (
+        microsoftAuthFailureHandled ||
+        sourceCandidate ||
+        spawnedThisAttempt ||
+        !sourceAuthFailuresSeen ||
+        !allowMicrosoftAfterSourceFailure ||
+        !isLikelySourceAuthFailure(reason)
+      ) {
+        return false;
+      }
+
+      microsoftAuthFailureHandled = true;
+      microsoftFallbackFailed = true;
+      allowMicrosoftAfterSourceFailure = false;
+      clearLoop();
+      clearReconnect();
+      if (bot === activeBot) bot = null;
+
+      const summary = summarizeErrorText(reason);
+      const suffix = summary ? `: ${summary}` : ".";
+      console.log(`[${ign}] ReplayFiller Microsoft authentication failed${suffix}`);
+
+      try {
+        activeBot.end("ReplayFiller Microsoft authentication failed");
+      } catch {
+        // The auth path may already have closed the connection.
+      }
+
+      setTimeout(() => createBot(), 0);
+      return true;
+    }
 
     activeBot._client.on("connect", () => {
       logDebug(`attempt #${attempt} socket connected`);
@@ -440,12 +690,16 @@ async function startBotWorker() {
 
     activeBot._client.on("packet", (data, meta) => {
       if (!["disconnect", "kick_disconnect"].includes(meta?.name)) return;
+      if (sourceAuthFailureHandled || microsoftAuthFailureHandled) return;
       lastDisconnectText = normalizeKickText(data?.reason ?? data);
-      handleDisconnectReason(
+      const handledBan = handleDisconnectReason(
         `attempt #${attempt} packet ${meta.name} (${meta.state || "unknown state"})`,
         data?.reason ?? data,
         activeBot,
       );
+      if (handledBan) return;
+      if (handleSourceAuthFailure(lastDisconnectText)) return;
+      handleMicrosoftFallbackFailure(lastDisconnectText);
     });
 
     activeBot._client.on("end", (reason) => {
@@ -465,7 +719,7 @@ async function startBotWorker() {
           `[${ign}] Authenticated as ${profile.name} (${profileUUID}), expected ${ign} (${uuid}).`,
         );
         clearLoop();
-        if (!usingSourceAuth) clearTokenCache();
+        if (!sourceCandidate) clearTokenCache();
         activeBot.end("Authenticated account does not match selected account");
       }
     });
@@ -481,13 +735,20 @@ async function startBotWorker() {
     });
 
     activeBot.on("kicked", (reason) => {
+      if (sourceAuthFailureHandled || microsoftAuthFailureHandled) return;
       if (handleDisconnectReason(`attempt #${attempt} kicked event`, reason, activeBot)) return;
       const reasonText = normalizeKickText(reason);
+      if (handleSourceAuthFailure(reasonText)) return;
+      if (handleMicrosoftFallbackFailure(reasonText)) return;
       console.log(`[${ign}] Kicked: ${reasonText || "No reason provided"}`);
       scheduleReconnect("kick");
     });
 
     activeBot.on("error", (err) => {
+      if (sourceAuthFailureHandled || microsoftAuthFailureHandled) return;
+      const text = errorText(err);
+      if (handleSourceAuthFailure(text)) return;
+      if (handleMicrosoftFallbackFailure(text)) return;
       console.log(`[${ign}] Error:`, err);
       clearLoop();
     });
@@ -495,6 +756,7 @@ async function startBotWorker() {
     activeBot.on("end", () => {
       clearLoop();
       if (bot === activeBot) bot = null;
+      if (sourceAuthFailureHandled || microsoftAuthFailureHandled) return;
       if (authMismatch) {
         console.log(
           `[${ign}] Stopped because the authenticated account does not match this ReplayFiller account.`,
@@ -533,6 +795,13 @@ async function startBotWorker() {
 
 // -- Input handling -----------------------------------------------------------
   rl.on("line", (input) => {
+    if (sourceFailureChoiceResolver) {
+      const resolve = sourceFailureChoiceResolver;
+      sourceFailureChoiceResolver = null;
+      resolve(input);
+      return;
+    }
+
     const cmd = input.trim().toLowerCase();
     switch (cmd) {
       case "stop":

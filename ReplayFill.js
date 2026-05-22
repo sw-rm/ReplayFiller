@@ -435,6 +435,31 @@ function uniqueLabels(labels) {
   return [...new Set(labels.filter(Boolean))];
 }
 
+function sourceSessionFromAccount(uuid, account) {
+  return {
+    ign: account.ign,
+    expiresAt: account.expiresAt,
+    selectedSource: {
+      id: account.sourceId,
+      label: account.sourceLabel,
+      path: account.sourcePath,
+    },
+    session: {
+      accessToken: account.accessToken,
+      selectedProfile: {
+        id: undashUUID(uuid),
+        name: account.ign,
+      },
+      availableProfiles: [
+        {
+          id: undashUUID(uuid),
+          name: account.ign,
+        },
+      ],
+    },
+  };
+}
+
 function buildSourceAccountGroups() {
   const groups = new Map();
 
@@ -455,12 +480,26 @@ function buildSourceAccountGroups() {
   return groups;
 }
 
-function sourceSessionIsValid(session, uuid) {
+function sourceSessionEntries(sourceSession) {
+  if (Array.isArray(sourceSession?.sourceSessions)) {
+    return sourceSession.sourceSessions;
+  }
+  return sourceSession?.session ? [sourceSession] : [];
+}
+
+function sourceSessionEntryIsValid(entry, uuid, sourceSession) {
+  const expiresAt = entry?.expiresAt ?? sourceSession?.expiresAt ?? null;
   return Boolean(
-    session?.session?.accessToken &&
-      session?.session?.selectedProfile?.id &&
-      normalizeUUID(session.session.selectedProfile.id) === normalizeUUID(uuid) &&
-      isAccessTokenFresh(session.expiresAt),
+    entry?.session?.accessToken &&
+      entry?.session?.selectedProfile?.id &&
+      normalizeUUID(entry.session.selectedProfile.id) === normalizeUUID(uuid) &&
+      isAccessTokenFresh(expiresAt),
+  );
+}
+
+function sourceSessionIsValid(sourceSession, uuid) {
+  return sourceSessionEntries(sourceSession).some((entry) =>
+    sourceSessionEntryIsValid(entry, uuid, sourceSession),
   );
 }
 
@@ -473,17 +512,15 @@ function getSourceStatus(uuid) {
   };
 }
 
-let sourceAccountsSynced = false;
 function syncSourceAccounts() {
-  if (sourceAccountsSynced) return 0;
-  sourceAccountsSynced = true;
-
   let imported = 0;
   for (const [uuid, accounts] of buildSourceAccountGroups()) {
-    const usable = accounts
+    const sortedAccounts = [...accounts].sort((left, right) =>
+      compareSourceAccountScore(right, left),
+    );
+    const usable = sortedAccounts
       .filter((account) => account.valid)
-      .sort((left, right) => compareSourceAccountScore(right, left));
-    const best = usable[0] || accounts.sort((left, right) => compareSourceAccountScore(right, left))[0];
+    const best = usable[0] || sortedAccounts[0];
     if (!best) continue;
 
     const sourceLabels = uniqueLabels(accounts.map((account) => account.sourceLabel));
@@ -498,30 +535,19 @@ function syncSourceAccounts() {
     });
 
     if (best.valid) {
+      const sourceSessions = usable.map((account) =>
+        sourceSessionFromAccount(uuid, account),
+      );
+      const primary = sourceSessions[0];
       writeSourceSession(uuid, {
         uuid,
-        ign: best.ign,
-        expiresAt: best.expiresAt,
+        ign: primary.ign,
+        expiresAt: primary.expiresAt,
         updatedAt: new Date().toISOString(),
-        selectedSource: {
-          id: best.sourceId,
-          label: best.sourceLabel,
-          path: best.sourcePath,
-        },
+        selectedSource: primary.selectedSource,
         sources: sourceLabels.map((label) => ({ label })),
-        session: {
-          accessToken: best.accessToken,
-          selectedProfile: {
-            id: undashUUID(uuid),
-            name: best.ign,
-          },
-          availableProfiles: [
-            {
-              id: undashUUID(uuid),
-              name: best.ign,
-            },
-          ],
-        },
+        sourceSessions,
+        session: primary.session,
       });
     }
 
@@ -791,14 +817,27 @@ function runBot(account, loopTarget) {
   };
 
   rl.close();
-  process.stdin.pause();
+  if (process.stdin.isTTY) process.stdin.setRawMode(false);
 
   const worker = spawn(process.execPath, [process.argv[1]], {
     env,
-    stdio: "inherit",
+    stdio: ["pipe", "inherit", "inherit"],
+  });
+  worker.stdin.on("error", () => {
+    // The worker may close stdin while the parent is still forwarding a final keypress.
+  });
+
+  const workerInput = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+    terminal: false,
+  });
+  workerInput.on("line", (line) => {
+    if (worker.stdin?.writable) worker.stdin.write(`${line}\n`);
   });
 
   worker.on("exit", (code) => {
+    workerInput.close();
     rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
