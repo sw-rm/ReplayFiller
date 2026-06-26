@@ -44,7 +44,12 @@ function getDataDir() {
         APP_NAME,
       );
     case "darwin":
-      return path.join(os.homedir(), "Library", "Application Support", APP_NAME);
+      return path.join(
+        os.homedir(),
+        "Library",
+        "Application Support",
+        APP_NAME,
+      );
     default:
       return path.join(os.homedir(), ".local", "share", APP_NAME);
   }
@@ -57,12 +62,19 @@ function getPlatformAppDataRoot() {
   if (process.platform === "darwin") {
     return path.join(os.homedir(), "Library", "Application Support");
   }
-  return process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+  return (
+    process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share")
+  );
 }
 
 function getMinecraftDir() {
   if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", "minecraft");
+    return path.join(
+      os.homedir(),
+      "Library",
+      "Application Support",
+      "minecraft",
+    );
   }
   if (process.platform === "win32") {
     return path.join(getPlatformAppDataRoot(), ".minecraft");
@@ -144,7 +156,13 @@ function deleteAccount(uuid) {
 function tokenDirForUUID(uuid) {
   const base = path.join(ACCOUNTS_DIR, uuid);
   if (process.platform === "darwin")
-    return path.join(base, "Library", "Application Support", "minecraft", "nmp-cache");
+    return path.join(
+      base,
+      "Library",
+      "Application Support",
+      "minecraft",
+      "nmp-cache",
+    );
   return path.join(base, ".minecraft", "nmp-cache");
 }
 
@@ -341,7 +359,9 @@ function undashUUID(value) {
 function isAccessTokenFresh(expiresAt) {
   if (!expiresAt) return true;
   const expires = new Date(expiresAt).getTime();
-  return Number.isFinite(expires) && expires > Date.now() + CACHE_EXPIRY_SKEW_MS;
+  return (
+    Number.isFinite(expires) && expires > Date.now() + CACHE_EXPIRY_SKEW_MS
+  );
 }
 
 function launcherSourceAccounts(source, parsed) {
@@ -368,6 +388,12 @@ function launcherSourceAccounts(source, parsed) {
     .filter(Boolean);
 }
 
+function decodeJwtExpiry(token) {
+  const payload = decodeJwtPayload(token);
+  if (!payload?.exp) return null;
+  return new Date(payload.exp * 1000).toISOString();
+}
+
 function iasSourceAccounts(source, parsed) {
   return (parsed?.accounts || [])
     .map((account, index) => {
@@ -376,16 +402,20 @@ function iasSourceAccounts(source, parsed) {
         return null;
       }
 
+      const expiresAt = decodeJwtExpiry(account.accessToken);
+      const tokenFresh = isAccessTokenFresh(expiresAt);
+      const valid = account.isValid !== false && tokenFresh;
+
       return {
         uuid,
         ign: account.name,
         accessToken: account.accessToken,
-        expiresAt: null,
+        expiresAt,
         sourceId: source.id,
         sourceLabel: source.label,
         sourcePath: source.path,
         active: index === 0,
-        valid: account.isValid !== false,
+        valid,
       };
     })
     .filter(Boolean);
@@ -409,7 +439,9 @@ function sourceAccountScore(account) {
   return [
     account.valid ? 1 : 0,
     account.active ? 1 : 0,
-    account.expiresAt ? new Date(account.expiresAt).getTime() || 0 : Number.MAX_SAFE_INTEGER,
+    account.expiresAt
+      ? new Date(account.expiresAt).getTime() || 0
+      : Number.MAX_SAFE_INTEGER,
     getFileMtime(account.sourcePath),
   ];
 }
@@ -491,9 +523,9 @@ function sourceSessionEntryIsValid(entry, uuid, sourceSession) {
   const expiresAt = entry?.expiresAt ?? sourceSession?.expiresAt ?? null;
   return Boolean(
     entry?.session?.accessToken &&
-      entry?.session?.selectedProfile?.id &&
-      normalizeUUID(entry.session.selectedProfile.id) === normalizeUUID(uuid) &&
-      isAccessTokenFresh(expiresAt),
+    entry?.session?.selectedProfile?.id &&
+    normalizeUUID(entry.session.selectedProfile.id) === normalizeUUID(uuid) &&
+    isAccessTokenFresh(expiresAt),
   );
 }
 
@@ -518,12 +550,13 @@ function syncSourceAccounts() {
     const sortedAccounts = [...accounts].sort((left, right) =>
       compareSourceAccountScore(right, left),
     );
-    const usable = sortedAccounts
-      .filter((account) => account.valid)
+    const usable = sortedAccounts.filter((account) => account.valid);
     const best = usable[0] || sortedAccounts[0];
     if (!best) continue;
 
-    const sourceLabels = uniqueLabels(accounts.map((account) => account.sourceLabel));
+    const sourceLabels = uniqueLabels(
+      accounts.map((account) => account.sourceLabel),
+    );
     const previousMeta = readMeta(uuid) || { uuid };
     const previousLabels = uniqueLabels(previousMeta.sourceLabels || []);
     const nextLabels = uniqueLabels([...previousLabels, ...sourceLabels]);
@@ -562,7 +595,9 @@ function syncSourceAccounts() {
 function syncAndReportSourceAccounts() {
   const imported = syncSourceAccounts();
   if (imported > 0) {
-    console.log(`  Imported ${imported} account(s) from launcher source files.`);
+    console.log(
+      `  Imported ${imported} account(s) from launcher source files.`,
+    );
   }
 }
 
@@ -686,18 +721,57 @@ function getBanStatusLabel(meta) {
   return banStatus.label || null;
 }
 
+function iasTokenExpiryLabel(uuid) {
+  for (const source of accountSourceFiles()) {
+    if (source.id !== "ias") continue;
+    try {
+      const parsed = parseJsonFile(source.path);
+      const account = (parsed?.accounts || []).find(
+        (a) => normalizeUUID(a?.uuid) === normalizeUUID(uuid),
+      );
+      if (!account?.accessToken) continue;
+      const expiresAt = decodeJwtExpiry(account.accessToken);
+      if (!expiresAt) continue;
+      const msLeft = new Date(expiresAt).getTime() - Date.now();
+      if (msLeft < 0) {
+        const minsAgo = Math.round(-msLeft / 60000);
+        return `IAS token expired ${minsAgo}m ago - join a server in Minecraft then rescan`;
+      }
+      const hLeft = Math.floor(msLeft / 3600000);
+      const mLeft = Math.floor((msLeft % 3600000) / 60000);
+      const timeStr = hLeft > 0 ? `${hLeft}h ${mLeft}m` : `${mLeft}m`;
+      return `IAS token valid for ${timeStr}`;
+    } catch {
+      // ignore parse errors
+    }
+  }
+  return null;
+}
+
 function getAccountSourceLabels(uuid, cacheStatus) {
   const meta = readMeta(uuid) || {};
   const sourceSession = readSourceSession(uuid);
-  const labels = [
+  const rawLabels = [
     ...(Array.isArray(meta.sourceLabels) ? meta.sourceLabels : []),
     ...(Array.isArray(sourceSession?.sources)
       ? sourceSession.sources.map((source) => source.label)
       : []),
   ];
 
+  const hasIAS = rawLabels.some((l) =>
+    l?.toLowerCase().includes("in-game account switcher"),
+  );
+
+  const labels = uniqueLabels(rawLabels).map((label) => {
+    if (hasIAS && label === "In-Game Account Switcher") {
+      const expiry = iasTokenExpiryLabel(uuid);
+      return expiry ? `${label} (${expiry})` : label;
+    }
+    return label;
+  });
+
   if (cacheStatus.valid) labels.push("ReplayFiller Microsoft");
-  return uniqueLabels(labels);
+  return labels;
 }
 
 function formatSourceLabels(labels) {
@@ -853,9 +927,7 @@ function runBot(account, loopTarget) {
 
 // -- Menus --------------------------------------------------------------------
 async function askLoopTarget() {
-  const input = (
-    await ask(`Loop count (Enter for ${DEFAULT_LOOP_TARGET}): `)
-  )
+  const input = (await ask(`Loop count (Enter for ${DEFAULT_LOOP_TARGET}): `))
     .trim()
     .toLowerCase();
 

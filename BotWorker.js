@@ -48,7 +48,7 @@ async function startBotWorker() {
 
   const mineflayer = require("mineflayer");
 
-// -- Readline -----------------------------------------------------------------
+  // -- Readline -----------------------------------------------------------------
   const readline = require("readline");
 
   const rl = readline.createInterface({
@@ -57,7 +57,7 @@ async function startBotWorker() {
     terminal: Boolean(process.stdin.isTTY),
   });
 
-// -- State --------------------------------------------------------------------
+  // -- State --------------------------------------------------------------------
   let bot = null;
   let currentInterval = null;
   let spawnTimeout = null;
@@ -74,7 +74,7 @@ async function startBotWorker() {
   let sourceFailureChoiceResolver = null;
   const failedSourceAuthKeys = new Set();
 
-// -- Helpers ------------------------------------------------------------------
+  // -- Helpers ------------------------------------------------------------------
   function parseLoopTarget(value) {
     const parsed = Number(value);
     return Number.isSafeInteger(parsed) && parsed > 0
@@ -86,7 +86,13 @@ async function startBotWorker() {
     if (authCacheDir) return authCacheDir;
     const base = path.join(ACCOUNTS_DIR, uuid);
     if (process.platform === "darwin") {
-      return path.join(base, "Library", "Application Support", "minecraft", "nmp-cache");
+      return path.join(
+        base,
+        "Library",
+        "Application Support",
+        "minecraft",
+        "nmp-cache",
+      );
     }
     return path.join(base, ".minecraft", "nmp-cache");
   }
@@ -130,7 +136,9 @@ async function startBotWorker() {
     if (!canReconnect() || reconnectTimeout) return;
 
     const suffix = reason ? ` after ${reason}` : "";
-    console.log(`[${ign}] Rejoining in ${REJOIN_DELAY_MS / 1000} seconds${suffix}...`);
+    console.log(
+      `[${ign}] Rejoining in ${REJOIN_DELAY_MS / 1000} seconds${suffix}...`,
+    );
     reconnectTimeout = setTimeout(() => {
       reconnectTimeout = null;
       if (!canReconnect()) return;
@@ -168,7 +176,9 @@ async function startBotWorker() {
 
   function hasCachedMicrosoftRefreshToken(data) {
     if (data?.token?.refresh_token) return true;
-    return Object.values(data || {}).some((value) => value?.token?.refresh_token);
+    return Object.values(data || {}).some(
+      (value) => value?.token?.refresh_token,
+    );
   }
 
   function hasReplayFillerMicrosoftCache(tDir) {
@@ -221,7 +231,8 @@ async function startBotWorker() {
   }
 
   function sourceCandidateFromEntry(entry, index, sourceSession) {
-    const selectedSource = entry?.selectedSource || sourceSession?.selectedSource || {};
+    const selectedSource =
+      entry?.selectedSource || sourceSession?.selectedSource || {};
     const candidate = {
       index,
       ign: entry?.ign || sourceSession?.ign,
@@ -241,21 +252,36 @@ async function startBotWorker() {
       return false;
     }
     return (
-      normalizeUUID(candidate.session.selectedProfile.id) === normalizeUUID(uuid) &&
-      isAccessTokenFresh(candidate.expiresAt)
+      normalizeUUID(candidate.session.selectedProfile.id) ===
+        normalizeUUID(uuid) &&
+      isAccessTokenFresh(candidate.expiresAt, candidate.session.accessToken)
     );
   }
 
-  function isAccessTokenFresh(expiresAt) {
-    if (!expiresAt) return true;
-    const expires = new Date(expiresAt).getTime();
-    return Number.isFinite(expires) && expires > Date.now() + 30_000;
+  function isAccessTokenFresh(expiresAt, accessToken) {
+    if (expiresAt) {
+      const expires = new Date(expiresAt).getTime();
+      return Number.isFinite(expires) && expires > Date.now() + 30_000;
+    }
+    if (accessToken && accessToken.includes(".")) {
+      try {
+        const payload = JSON.parse(
+          Buffer.from(accessToken.split(".")[1], "base64url").toString(),
+        );
+        if (payload?.exp) {
+          return payload.exp * 1000 > Date.now() + 30_000;
+        }
+      } catch {}
+    }
+    return true;
   }
 
   function getSourceAuthCandidates() {
     const sourceSession = readSourceSession();
     const candidates = getSourceSessionEntries(sourceSession)
-      .map((entry, index) => sourceCandidateFromEntry(entry, index, sourceSession))
+      .map((entry, index) =>
+        sourceCandidateFromEntry(entry, index, sourceSession),
+      )
       .filter(isSourceCandidateValid);
 
     return candidates.map((candidate, index) => ({
@@ -349,7 +375,14 @@ async function startBotWorker() {
         .join(" ");
     }
 
-    const preferredParts = ["text", "translate", "extra", "with", "value", "json"]
+    const preferredParts = [
+      "text",
+      "translate",
+      "extra",
+      "with",
+      "value",
+      "json",
+    ]
       .filter((key) => Object.prototype.hasOwnProperty.call(value, key))
       .map((key) => extractKickText(value[key], seen, depth + 1))
       .filter(Boolean);
@@ -433,7 +466,9 @@ async function startBotWorker() {
       type: "temporary",
       label: `BAN - ${durationText}`,
       durationText,
-      until: durationMs ? new Date(Date.now() + durationMs).toISOString() : null,
+      until: durationMs
+        ? new Date(Date.now() + durationMs).toISOString()
+        : null,
       lastSeenAt: new Date().toISOString(),
       raw: reasonText,
     };
@@ -471,9 +506,7 @@ async function startBotWorker() {
   function errorText(error) {
     if (!error) return "";
     if (typeof error === "string") return error;
-    return [error.name, error.message, error.stack]
-      .filter(Boolean)
-      .join(" ");
+    return [error.name, error.message, error.stack].filter(Boolean).join(" ");
   }
 
   function summarizeErrorText(text) {
@@ -491,9 +524,52 @@ async function startBotWorker() {
     );
   }
 
+  function getExpiredIasHint() {
+    try {
+      const session = JSON.parse(
+        require("fs").readFileSync(sourceSessionFile, "utf8"),
+      );
+      const entries = Array.isArray(session?.sourceSessions)
+        ? session.sourceSessions
+        : session?.session
+          ? [session]
+          : [];
+
+      for (const entry of entries) {
+        const sourceId = entry?.selectedSource?.id;
+        if (sourceId !== "ias") continue;
+        const token = entry?.session?.accessToken;
+        if (!token?.includes(".")) continue;
+        try {
+          const payload = JSON.parse(
+            Buffer.from(token.split(".")[1], "base64url").toString(),
+          );
+          if (payload?.exp && payload.exp * 1000 < Date.now()) {
+            const minsAgo = Math.round(
+              (Date.now() - payload.exp * 1000) / 60000,
+            );
+            return `IAS token for ${ign} expired ${minsAgo} minute(s) ago.\n  Fix: join any server on this account in Minecraft, disconnect, then choose option 1 to rescan.`;
+          }
+        } catch {
+          // not decodable
+        }
+      }
+    } catch {
+      // can't read session file
+    }
+    return null;
+  }
+
   function askSourceFailureChoice() {
-    console.log(`[${ign}] All imported account-source sessions failed.`);
-    console.log("  1) Re-login in game, then return to the account manager to rescan");
+    const hint = getExpiredIasHint();
+    if (hint) {
+      console.log(`[${ign}] ${hint}`);
+    } else {
+      console.log(`[${ign}] All imported account-source sessions failed.`);
+    }
+    console.log(
+      "  1) Re-login in game, then return to the account manager to rescan",
+    );
     console.log("  2) Add/use ReplayFiller Microsoft login now");
     process.stdout.write("Choice (1/2): ");
     return new Promise((resolve) => {
@@ -530,7 +606,9 @@ async function startBotWorker() {
 
   function buildBotOptions(tDir, sourceCandidate) {
     if (sourceCandidate) {
-      console.log(`[${ign}] Using ${sourceAttemptText(sourceCandidate)} session.`);
+      console.log(
+        `[${ign}] Using ${sourceAttemptText(sourceCandidate)} session.`,
+      );
       return {
         host: "hypixel.net",
         version: "1.8.9",
@@ -563,11 +641,15 @@ async function startBotWorker() {
 
   function startHousingLoop() {
     clearLoop();
-    console.log(`[${ign}] Starting /housing random loop (${loopTarget} total)...`);
+    console.log(
+      `[${ign}] Starting /housing random loop (${loopTarget} total)...`,
+    );
     currentInterval = setInterval(() => {
       if (count >= loopTarget) {
         clearLoop();
-        console.log(`[${ign}] Completed ${loopTarget} /housing random commands.`);
+        console.log(
+          `[${ign}] Completed ${loopTarget} /housing random commands.`,
+        );
         return;
       }
       if (bot && !isPaused) {
@@ -606,7 +688,28 @@ async function startBotWorker() {
     let microsoftAuthFailureHandled = false;
     logDebug(`connect attempt #${attempt}`);
 
-    const activeBot = mineflayer.createBot(buildBotOptions(tDir, sourceCandidate));
+    if (sourceCandidate?.session?.accessToken?.includes(".")) {
+      try {
+        const payload = JSON.parse(
+          Buffer.from(
+            sourceCandidate.session.accessToken.split(".")[1],
+            "base64url",
+          ).toString(),
+        );
+
+        console.log("================================");
+        console.log("JWT IAT:", new Date(payload.iat * 1000));
+        console.log("JWT EXP:", new Date(payload.exp * 1000));
+        console.log("NOW:", new Date());
+        console.log("================================");
+      } catch (e) {
+        console.log("Failed to decode JWT:", e);
+      }
+    }
+
+    const activeBot = mineflayer.createBot(
+      buildBotOptions(tDir, sourceCandidate),
+    );
     bot = activeBot;
 
     function handleSourceAuthFailure(reason) {
@@ -625,6 +728,25 @@ async function startBotWorker() {
       clearLoop();
       clearReconnect();
       if (bot === activeBot) bot = null;
+
+      console.log("================================");
+      console.log("SOURCE AUTH FAILURE");
+      console.log("Reason type:", typeof reason);
+      console.log("Reason:", reason);
+
+      if (reason instanceof Error) {
+        console.log("Name:", reason.name);
+        console.log("Message:", reason.message);
+        console.log("Stack:");
+        console.log(reason.stack);
+      }
+
+      try {
+        console.log("JSON:");
+        console.log(JSON.stringify(reason, null, 2));
+      } catch {}
+
+      console.log("================================");
 
       const summary = summarizeErrorText(reason);
       const suffix = summary ? `: ${summary}` : ".";
@@ -668,7 +790,9 @@ async function startBotWorker() {
 
       const summary = summarizeErrorText(reason);
       const suffix = summary ? `: ${summary}` : ".";
-      console.log(`[${ign}] ReplayFiller Microsoft authentication failed${suffix}`);
+      console.log(
+        `[${ign}] ReplayFiller Microsoft authentication failed${suffix}`,
+      );
 
       try {
         activeBot.end("ReplayFiller Microsoft authentication failed");
@@ -736,7 +860,14 @@ async function startBotWorker() {
 
     activeBot.on("kicked", (reason) => {
       if (sourceAuthFailureHandled || microsoftAuthFailureHandled) return;
-      if (handleDisconnectReason(`attempt #${attempt} kicked event`, reason, activeBot)) return;
+      if (
+        handleDisconnectReason(
+          `attempt #${attempt} kicked event`,
+          reason,
+          activeBot,
+        )
+      )
+        return;
       const reasonText = normalizeKickText(reason);
       if (handleSourceAuthFailure(reasonText)) return;
       if (handleMicrosoftFallbackFailure(reasonText)) return;
@@ -745,10 +876,26 @@ async function startBotWorker() {
     });
 
     activeBot.on("error", (err) => {
+      console.log("================================");
+      console.log("BOT ERROR");
+      console.log("Name:", err?.name);
+      console.log("Message:", err?.message);
+      console.log("Stack:");
+      console.log(err?.stack);
+
+      try {
+        console.log("JSON:");
+        console.log(JSON.stringify(err, null, 2));
+      } catch {}
+
+      console.log("================================");
+
       if (sourceAuthFailureHandled || microsoftAuthFailureHandled) return;
+
       const text = errorText(err);
       if (handleSourceAuthFailure(text)) return;
       if (handleMicrosoftFallbackFailure(text)) return;
+
       console.log(`[${ign}] Error:`, err);
       clearLoop();
     });
@@ -767,7 +914,7 @@ async function startBotWorker() {
     });
   }
 
-// -- Commands -----------------------------------------------------------------
+  // -- Commands -----------------------------------------------------------------
   function stopBot() {
     isPaused = true;
     clearLoop();
@@ -793,7 +940,7 @@ async function startBotWorker() {
     createBot();
   }
 
-// -- Input handling -----------------------------------------------------------
+  // -- Input handling -----------------------------------------------------------
   rl.on("line", (input) => {
     if (sourceFailureChoiceResolver) {
       const resolve = sourceFailureChoiceResolver;
@@ -821,7 +968,9 @@ async function startBotWorker() {
         process.exit(42);
         break;
       case "help":
-        console.log("Runtime commands: stop, continue, status, menu, help, quit");
+        console.log(
+          "Runtime commands: stop, continue, status, menu, help, quit",
+        );
         break;
       case "quit":
       case "exit":
@@ -833,12 +982,14 @@ async function startBotWorker() {
         break;
       default:
         if (cmd !== "") {
-          console.log(`Unknown command: ${cmd}. Type "help" for available commands.`);
+          console.log(
+            `Unknown command: ${cmd}. Type "help" for available commands.`,
+          );
         }
     }
   });
 
-// -- Graceful shutdown --------------------------------------------------------
+  // -- Graceful shutdown --------------------------------------------------------
   process.on("SIGINT", () => {
     console.log("\nShutting down...");
     isPaused = true;
@@ -848,7 +999,7 @@ async function startBotWorker() {
     process.exit(0);
   });
 
-// -- Entry point --------------------------------------------------------------
+  // -- Entry point --------------------------------------------------------------
   createBot();
 }
 
