@@ -88,7 +88,7 @@ ReplayFiller/
 
 Each account's tokens are fully isolated so switching accounts always uses the correct credentials.
 
-When the account menu opens, ReplayFiller scans default account source paths, including Lunar Client `accounts.json`, Minecraft Launcher account files, and IAS `ias.json`. Any recognizable Minecraft profile gets a ReplayFiller account folder, and usable source sessions are saved there for launching.
+When the account menu opens, ReplayFiller scans default account source paths, including Lunar Client `accounts.json`, Minecraft Launcher account files, IAS `ias.json`, and Meowtils Account Manager's `accounts.json`. Any recognizable Minecraft profile gets a ReplayFiller account folder, and usable source sessions are saved there for launching.
 
 IGNs are always fetched fresh from Mojang when the menu loads, so name changes are reflected automatically. The last known IGN is also saved in `meta.json` as a fallback when offline.
 

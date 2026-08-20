@@ -31,6 +31,11 @@ process.emit = function (name, data) {
 const path = require("path");
 const fs = require("fs");
 const { Titles } = require("prismarine-auth");
+const {
+  refreshReplayFillerSession,
+  refreshIasSession,
+  MsaRefreshError,
+} = require("./msaTokenRefresh");
 
 const DEFAULT_LOOP_TARGET = 600;
 const REJOIN_DELAY_MS = 5000;
@@ -239,6 +244,8 @@ async function startBotWorker() {
       expiresAt: entry?.expiresAt ?? sourceSession?.expiresAt ?? null,
       selectedSource,
       session: entry?.session,
+      authFlow: entry?.authFlow ?? null,
+      refreshToken: entry?.refreshToken ?? null,
     };
     candidate.key = sourceCandidateKey(candidate);
     return candidate;
@@ -604,7 +611,109 @@ async function startBotWorker() {
     }
   }
 
-  function buildBotOptions(tDir, sourceCandidate) {
+  function iasRefreshCachePath() {
+    return path.join(ACCOUNTS_DIR, uuid, "ias-refresh-cache.json");
+  }
+
+  function readCachedIasRefreshToken() {
+    try {
+      const data = JSON.parse(fs.readFileSync(iasRefreshCachePath(), "utf8"));
+      return data?.refreshToken || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeCachedIasRefreshToken(refreshToken) {
+    const dir = path.join(ACCOUNTS_DIR, uuid);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      iasRefreshCachePath(),
+      JSON.stringify(
+        { refreshToken, updatedAt: new Date().toISOString() },
+        null,
+        2,
+      ),
+    );
+  }
+
+  // Persist a refreshed source session back into source-session.json so the
+  // next selectSourceAuthCandidate() call (e.g. after a reconnect) treats
+  // this source as fresh again, without needing to re-run the refresh.
+  function persistRefreshedSourceSession(candidate, session) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(sourceSessionFile, "utf8"));
+      if (
+        Array.isArray(raw.sourceSessions) &&
+        raw.sourceSessions[candidate.index]
+      ) {
+        raw.sourceSessions[candidate.index].session = session;
+        raw.sourceSessions[candidate.index].expiresAt = null;
+      } else if (raw.session) {
+        raw.session = session;
+        raw.expiresAt = null;
+      } else {
+        return;
+      }
+      fs.writeFileSync(sourceSessionFile, JSON.stringify(raw, null, 2));
+    } catch {
+      // Best-effort; a failure here just means we won't benefit from this
+      // refresh on the *next* launch. This session still works right now.
+    }
+  }
+
+  // Try to silently refresh a failed source candidate (currently: In-Game
+  // Account Switcher) using its Microsoft refresh_token. On success, persists
+  // the new access token so the next selectSourceAuthCandidate() call picks
+  // it up as fresh, and caches the rotated refresh token locally. Returns
+  // true if the refresh succeeded.
+  async function refreshAndPersistSourceSession(candidate) {
+    if (candidate?.authFlow !== "ias") return false;
+    const refreshToken = readCachedIasRefreshToken() || candidate.refreshToken;
+    if (!refreshToken) return false;
+
+    try {
+      const { session, rotatedRefreshToken } =
+        await refreshIasSession(refreshToken);
+      writeCachedIasRefreshToken(rotatedRefreshToken);
+      persistRefreshedSourceSession(candidate, session);
+      console.log(
+        `[${ign}] Silently refreshed ${sourceCandidateLabel(candidate)} session for ${session.selectedProfile.name}.`,
+      );
+      return true;
+    } catch (err) {
+      const stage = err instanceof MsaRefreshError ? err.stage : "error";
+      console.log(
+        `[${ign}] Silent ${sourceCandidateLabel(candidate)} refresh failed (${stage}): ${err.message}`,
+      );
+      return false;
+    }
+  }
+
+  // Try to silently turn a cached ReplayFiller Microsoft refresh_token into a
+  // fresh Minecraft session, without triggering the interactive device-code
+  // flow. Returns null (and logs why) if there's nothing usable cached or the
+  // refresh chain fails for any reason - callers should fall back to the
+  // normal interactive "microsoft" auth branch in that case.
+  async function getOrRefreshMicrosoftSession(tDir) {
+    try {
+      const session = await refreshReplayFillerSession(tDir);
+      if (session) {
+        console.log(
+          `[${ign}] Silently refreshed ReplayFiller Microsoft session for ${session.selectedProfile.name}.`,
+        );
+      }
+      return session;
+    } catch (err) {
+      const stage = err instanceof MsaRefreshError ? err.stage : "error";
+      console.log(
+        `[${ign}] Silent Microsoft refresh failed (${stage}): ${err.message}`,
+      );
+      return null;
+    }
+  }
+
+  function buildBotOptions(tDir, sourceCandidate, refreshedSession) {
     if (sourceCandidate) {
       console.log(
         `[${ign}] Using ${sourceAttemptText(sourceCandidate)} session.`,
@@ -615,6 +724,21 @@ async function startBotWorker() {
         username: sourceCandidate.session.selectedProfile.name,
         auth: require("minecraft-protocol/src/client/mojangAuth"),
         session: sourceCandidate.session,
+        profilesFolder: false,
+        skipValidation: true,
+      };
+    }
+
+    if (refreshedSession) {
+      console.log(
+        `[${ign}] Using silently refreshed ReplayFiller Microsoft session.`,
+      );
+      return {
+        host: "hypixel.net",
+        version: "1.8.9",
+        username: refreshedSession.selectedProfile.name,
+        auth: require("minecraft-protocol/src/client/mojangAuth"),
+        session: refreshedSession,
         profilesFolder: false,
         skipValidation: true,
       };
@@ -660,7 +784,7 @@ async function startBotWorker() {
     }, 3750);
   }
 
-  function createBot() {
+  async function createBot() {
     clearReconnect();
     const tDir = tokenDir();
     if (!fs.existsSync(tDir)) fs.mkdirSync(tDir, { recursive: true });
@@ -678,6 +802,14 @@ async function startBotWorker() {
         promptAfterAllSourceAuthFailed();
         return;
       }
+    }
+
+    let refreshedSession = null;
+    if (!sourceCandidate) {
+      refreshedSession = await getOrRefreshMicrosoftSession(tDir);
+      // State may have changed while we were waiting on the network (e.g.
+      // the user typed "stop", or a ban got flagged from elsewhere).
+      if (isPaused || isBanned || authMismatch) return;
     }
 
     connectionAttempt++;
@@ -708,7 +840,7 @@ async function startBotWorker() {
     }
 
     const activeBot = mineflayer.createBot(
-      buildBotOptions(tDir, sourceCandidate),
+      buildBotOptions(tDir, sourceCandidate, refreshedSession),
     );
     bot = activeBot;
 
@@ -723,8 +855,6 @@ async function startBotWorker() {
       }
 
       sourceAuthFailureHandled = true;
-      sourceAuthFailuresSeen = true;
-      failedSourceAuthKeys.add(sourceCandidate.key);
       clearLoop();
       clearReconnect();
       if (bot === activeBot) bot = null;
@@ -760,12 +890,17 @@ async function startBotWorker() {
         // The auth path may already have closed the connection.
       }
 
-      setTimeout(() => {
-        if (hasUntriedSourceAuthCandidate()) {
-          console.log(`[${ign}] Trying next account source...`);
+      (async () => {
+        const refreshed = await refreshAndPersistSourceSession(sourceCandidate);
+        if (!refreshed) {
+          sourceAuthFailuresSeen = true;
+          failedSourceAuthKeys.add(sourceCandidate.key);
+          if (hasUntriedSourceAuthCandidate()) {
+            console.log(`[${ign}] Trying next account source...`);
+          }
         }
         createBot();
-      }, 0);
+      })();
       return true;
     }
 

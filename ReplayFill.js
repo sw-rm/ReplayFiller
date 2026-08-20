@@ -22,6 +22,12 @@ const https = require("https");
 const { spawn } = require("child_process");
 const { Authflow, Titles } = require("prismarine-auth");
 const { startBotWorker } = require("./BotWorker");
+const {
+  refreshReplayFillerSession,
+  refreshIasSession,
+  refreshMeowtilsSession,
+  MsaRefreshError,
+} = require("./msaTokenRefresh");
 
 const APP_NAME = "ReplayFiller";
 const AUTH_CACHE_USERNAME = "Player";
@@ -165,6 +171,48 @@ function tokenDirForUUID(uuid) {
     );
   return path.join(base, ".minecraft", "nmp-cache");
 }
+
+// -- Source refresh-token cache -------------------------------------------------
+// A locally-tracked copy of a rotated source (e.g. IAS) refresh token,
+// stored under ReplayFiller's own account folder. Microsoft commonly
+// rotates refresh tokens on use, so re-reading the original value from the
+// source launcher's file on every attempt would go stale after the first
+// silent refresh. This never reads or writes the source launcher's own
+// files.
+function sourceRefreshCachePath(sourceId, uuid) {
+  return path.join(ACCOUNTS_DIR, uuid, `${sourceId}-refresh-cache.json`);
+}
+
+function readCachedSourceRefreshToken(sourceId, uuid) {
+  try {
+    const data = JSON.parse(
+      fs.readFileSync(sourceRefreshCachePath(sourceId, uuid), "utf8"),
+    );
+    return data?.refreshToken || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedSourceRefreshToken(sourceId, uuid, refreshToken) {
+  ensureAccountDir(uuid);
+  fs.writeFileSync(
+    sourceRefreshCachePath(sourceId, uuid),
+    JSON.stringify(
+      { refreshToken, updatedAt: new Date().toISOString() },
+      null,
+      2,
+    ),
+  );
+}
+
+// Source ids that we know how to silently refresh (each needs a matching
+// entry here and in SOURCE_REFRESHERS below).
+const SILENT_REFRESH_SOURCE_IDS = new Set(["ias", "meowtils"]);
+const SOURCE_REFRESHERS = {
+  ias: refreshIasSession,
+  meowtils: refreshMeowtilsSession,
+};
 
 // -- Cache validity -----------------------------------------------------------
 function normalizeUUID(value) {
@@ -323,6 +371,10 @@ function iasAccountsCandidates() {
   return [path.join(getMinecraftDir(), "config", "ias.json")];
 }
 
+function meowtilsAccountsCandidates() {
+  return [path.join(getMinecraftDir(), "accounts.json")];
+}
+
 function accountSourceFiles() {
   return [
     {
@@ -342,6 +394,12 @@ function accountSourceFiles() {
       label: "In-Game Account Switcher",
       parser: "ias-json",
       paths: iasAccountsCandidates(),
+    },
+    {
+      id: "meowtils",
+      label: "Meowtils Account Manager",
+      parser: "meowtils-json",
+      paths: meowtilsAccountsCandidates(),
     },
   ].flatMap((source) =>
     uniqueExistingFiles(source.paths).map((filePath) => ({
@@ -410,12 +468,44 @@ function iasSourceAccounts(source, parsed) {
         uuid,
         ign: account.name,
         accessToken: account.accessToken,
+        refreshToken: account.refreshToken || null,
         expiresAt,
         sourceId: source.id,
         sourceLabel: source.label,
         sourcePath: source.path,
         active: index === 0,
         valid,
+      };
+    })
+    .filter(Boolean);
+}
+
+function meowtilsSourceAccounts(source, parsed) {
+  return (Array.isArray(parsed) ? parsed : [])
+    .map((account, index) => {
+      // Meowtils only records username, not UUID - recover it from the
+      // Minecraft access token JWT the same way getTokenProfileUUID() does
+      // for cached mca tokens.
+      const uuid = formatUUID(
+        getTokenProfileUUID({ access_token: account?.accessToken }),
+      );
+      if (!UUID_RE.test(uuid) || !account?.username || !account?.accessToken) {
+        return null;
+      }
+
+      const expiresAt = decodeJwtExpiry(account.accessToken);
+
+      return {
+        uuid,
+        ign: account.username,
+        accessToken: account.accessToken,
+        refreshToken: account.refreshToken || null,
+        expiresAt,
+        sourceId: source.id,
+        sourceLabel: source.label,
+        sourcePath: source.path,
+        active: index === 0,
+        valid: isAccessTokenFresh(expiresAt),
       };
     })
     .filter(Boolean);
@@ -430,6 +520,10 @@ function readSourceAccounts(source) {
 
   if (source.parser === "ias-json") {
     return iasSourceAccounts(source, parsed);
+  }
+
+  if (source.parser === "meowtils-json") {
+    return meowtilsSourceAccounts(source, parsed);
   }
 
   return [];
@@ -476,6 +570,14 @@ function sourceSessionFromAccount(uuid, account) {
       label: account.sourceLabel,
       path: account.sourcePath,
     },
+    // authFlow/refreshToken let a silent refresh happen later without
+    // re-reading the source launcher's file (which may have since rotated
+    // or removed the token). Only populated for sources we know how to
+    // refresh (see SILENT_REFRESH_SOURCE_IDS / SOURCE_REFRESHERS above).
+    authFlow: SILENT_REFRESH_SOURCE_IDS.has(account.sourceId)
+      ? account.sourceId
+      : null,
+    refreshToken: account.refreshToken || null,
     session: {
       accessToken: account.accessToken,
       selectedProfile: {
@@ -551,6 +653,13 @@ function syncSourceAccounts() {
       compareSourceAccountScore(right, left),
     );
     const usable = sortedAccounts.filter((account) => account.valid);
+    // An account with an expired access token but a live refresh_token is
+    // still worth writing into source-session.json - that's exactly the
+    // case refreshSourceSession() exists to recover. Only excluding accounts
+    // with neither a fresh token nor any refresh_token to fall back on.
+    const recoverable = sortedAccounts.filter(
+      (account) => account.valid || account.refreshToken,
+    );
     const best = usable[0] || sortedAccounts[0];
     if (!best) continue;
 
@@ -567,8 +676,8 @@ function syncSourceAccounts() {
       sourceLabels: nextLabels,
     });
 
-    if (best.valid) {
-      const sourceSessions = usable.map((account) =>
+    if (recoverable.length > 0) {
+      const sourceSessions = recoverable.map((account) =>
         sourceSessionFromAccount(uuid, account),
       );
       const primary = sourceSessions[0];
@@ -839,6 +948,89 @@ async function authenticateAccount(account, { forceRefresh = false } = {}) {
   return { ...account, ign: profile.name };
 }
 
+// Try to silently refresh a source-imported (currently: In-Game Account
+// Switcher) account using its Microsoft refresh_token, without touching the
+// source launcher's own files. Returns null if there's no usable refresh
+// token or no refreshable source for this account.
+async function refreshSourceSession(uuid) {
+  const sourceSession = readSourceSession(uuid);
+  const entries = sourceSessionEntries(sourceSession);
+  const refreshableEntry = entries.find(
+    (entry) => entry?.authFlow && SOURCE_REFRESHERS[entry.authFlow],
+  );
+  if (!refreshableEntry) return null;
+
+  const sourceId = refreshableEntry.authFlow;
+  const refreshToken =
+    readCachedSourceRefreshToken(sourceId, uuid) ||
+    refreshableEntry.refreshToken;
+  if (!refreshToken) return null;
+
+  const { session, rotatedRefreshToken } =
+    await SOURCE_REFRESHERS[sourceId](refreshToken);
+  writeCachedSourceRefreshToken(sourceId, uuid, rotatedRefreshToken);
+  return session;
+}
+
+// Try a silent Microsoft refresh_token -> access_token exchange first; then
+// try a silent source (IAS/Meowtils) refresh; only fall back to the
+// interactive device-code login if neither works.
+async function recoverInvalidAccount(account) {
+  console.log("Cache is invalid. Trying a silent Microsoft refresh...");
+  try {
+    const session = await refreshReplayFillerSession(
+      tokenDirForUUID(account.uuid),
+    );
+    if (session) {
+      console.log(
+        `Silently refreshed session for ${session.selectedProfile.name}.`,
+      );
+      const meta = readMeta(account.uuid) || { uuid: account.uuid };
+      writeMeta(account.uuid, {
+        ...meta,
+        uuid: account.uuid,
+        ignAtAdd: session.selectedProfile.name,
+      });
+      return { ...account, ign: session.selectedProfile.name, valid: true };
+    }
+  } catch (error) {
+    const stage = error instanceof MsaRefreshError ? error.stage : "error";
+    console.log(`Silent refresh failed (${stage}): ${error.message}`);
+  }
+
+  console.log("Trying a silent source refresh...");
+  try {
+    const session = await refreshSourceSession(account.uuid);
+    if (session) {
+      console.log(
+        `Silently refreshed source session for ${session.selectedProfile.name}.`,
+      );
+      const meta = readMeta(account.uuid) || { uuid: account.uuid };
+      writeMeta(account.uuid, {
+        ...meta,
+        uuid: account.uuid,
+        ignAtAdd: session.selectedProfile.name,
+      });
+      return { ...account, ign: session.selectedProfile.name, valid: true };
+    }
+  } catch (error) {
+    const stage = error instanceof MsaRefreshError ? error.stage : "error";
+    console.log(`Silent source refresh failed (${stage}): ${error.message}`);
+  }
+
+  console.log("Falling back to interactive Microsoft login...");
+  try {
+    const authenticated = await authenticateAccount(account, {
+      forceRefresh: true,
+    });
+    console.log(`Authenticated as ${authenticated.ign}.`);
+    return authenticated;
+  } catch (error) {
+    console.log(`Authentication failed: ${error.message}`);
+    return null;
+  }
+}
+
 async function buildAccountList() {
   const uuids = listAccountUUIDs();
   console.log("  Fetching account info...");
@@ -997,15 +1189,11 @@ async function selectAccountMenu() {
 
   let chosen = accounts[idx - 1];
   if (!chosen.valid) {
-    console.log("Cache is invalid. Starting Microsoft login before launch...");
-    try {
-      chosen = await authenticateAccount(chosen, { forceRefresh: true });
-      console.log(`Authenticated as ${chosen.ign}.`);
-    } catch (error) {
-      console.log(`Authentication failed: ${error.message}`);
-      return selectAccountMenu();
-    }
+    const recovered = await recoverInvalidAccount(chosen);
+    if (!recovered) return selectAccountMenu();
+    chosen = recovered;
   }
+
   const loopTarget = await askLoopTarget();
   console.log(
     `\nStarting bot as ${chosen.ign} for ${loopTarget} loop(s)... (type "help" for runtime commands)\n`,
